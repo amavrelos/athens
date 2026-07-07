@@ -156,31 +156,31 @@ guard('mixer', function () {
             page.makeValueBinding(mixKnobs[strip].mSurfaceValue, ch.mValue.mVolume)
             var vol = mixKnobs[strip].mSurfaceValue
             // surface-value callbacks: (ctx, newValue, oldValue) / (ctx, objTitle, valTitle)
-            vol.mOnProcessValueChange = function (ctx, v) { send(ctx, eVolume(strip, v)) }
+            vol.mOnProcessValueChange = function (ctx, v) { trackVol[strip] = v; send(ctx, eVolume(strip, v)) }
             // KNOWN Cubase-engine caveat (forum: "mOnTitleChange broken for
             // some bindings", since ~12.0.60): this callback on a
             // MixerBankChannel volume binding can stop firing after
             // mNextBank/mPrevBank — values keep flowing but names go stale on
             // the new window. Host-side defect; if it bites, re-select a track
             // to refresh names (values/mutes/selection are unaffected).
-            vol.mOnTitleChange = function (ctx, o) { send(ctx, eName(strip, o)) }
+            vol.mOnTitleChange = function (ctx, o) { trackName[strip] = o; send(ctx, eName(strip, o)) }
             // pan / mute / solo / select / VU each bind INDEPENDENTLY — a quirk
             // in one must not skip the others. Per-feature status lands in DIAG,
             // so a WHO probe reports which bindings the host API accepted.
             guard('pan', function () {
                 page.makeValueBinding(panKnobs[strip].mSurfaceValue, ch.mValue.mPan)
                 panKnobs[strip].mSurfaceValue.mOnProcessValueChange = function (ctx, v) {
-                    send(ctx, ePan(strip, v)) }
+                    trackPan[strip] = v; send(ctx, ePan(strip, v)) }
             })
             guard('mute', function () {
                 page.makeValueBinding(muteBtns[strip].mSurfaceValue, ch.mValue.mMute).setTypeToggle()
                 muteBtns[strip].mSurfaceValue.mOnProcessValueChange = function (ctx, v) {
-                    send(ctx, eFlag(strip, FLAG.MUTE, v >= 0.5)) }
+                    trackMute[strip] = v >= 0.5; send(ctx, eFlag(strip, FLAG.MUTE, v >= 0.5)) }
             })
             guard('solo', function () {
                 page.makeValueBinding(soloBtns[strip].mSurfaceValue, ch.mValue.mSolo).setTypeToggle()
                 soloBtns[strip].mSurfaceValue.mOnProcessValueChange = function (ctx, v) {
-                    send(ctx, eFlag(strip, FLAG.SOLO, v >= 0.5)) }
+                    trackSolo[strip] = v >= 0.5; send(ctx, eFlag(strip, FLAG.SOLO, v >= 0.5)) }
             })
             guard('select', function () {
                 // selection: fire only for the newly-SELECTED track (v -> 1)
@@ -227,6 +227,24 @@ var NUM_INSERTS = 8
 var insertNames = []          // slot -> plugin name, for the ROTO's plugin list
 var insertActs = []           // slot -> hidden button that activates its subpage
 var currentSlot = 0           // which plugin subpage is live (restored on activate)
+// last-known mixer state per strip so the HELLO handshake can replay it on a
+// mid-session connect (the mixer callbacks are change-only). Mirrors insertNames.
+var trackName = [], trackVol = [], trackPan = [], trackMute = [], trackSolo = []
+
+// Replay the cached mixer onto a (re)connecting Athens — eCount seeds the strips,
+// then every known name/volume/pan/mute/solo is re-sent, so the ROTO fills in
+// with NO gesture in Cubase. The mixer analogue of pushInsertList.
+function pushMixer(ctx) {
+    send(ctx, eCount(NUM_STRIPS))
+    for (var s = 0; s < NUM_STRIPS; ++s) {
+        if (trackName[s] != null) send(ctx, eName(s, trackName[s]))
+        if (trackVol[s] != null) send(ctx, eVolume(s, trackVol[s]))
+        if (trackPan[s] != null) send(ctx, ePan(s, trackPan[s]))
+        if (trackMute[s] != null) send(ctx, eFlag(s, FLAG.MUTE, trackMute[s]))
+        if (trackSolo[s] != null) send(ctx, eFlag(s, FLAG.SOLO, trackSolo[s]))
+    }
+}
+
 function pushInsertList(ctx) {
     // report through the LAST populated slot, not up to the first gap: slot 0 is
     // the instrument (empty on audio tracks) and inserts can sit past it, so a
@@ -336,6 +354,7 @@ midiInput.mOnSysex = function (activeDevice, message) {
         // (reconnect) gets the full replay below, so idle sessions aren't re-pushed.
         if (p.length === 0) {
             for (var dk in DIAG) send(activeDevice, eDiag(dk + '=' + DIAG[dk]))
+            pushMixer(activeDevice)              // replay the mixer (count+names+values)
             // Re-announce the current plugin(s) on every (re)connect: identity
             // callbacks fire only on CHANGE, so a plugin loaded before Athens
             // connected would otherwise never be sent. insertNames[] survives

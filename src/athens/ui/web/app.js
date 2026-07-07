@@ -199,9 +199,11 @@
   }
 
   function renderReaperLink() {
-    // Dot + name reflect REAL liveness: green/named only once the DAW is feeding
-    // us (tracks present) — no premature name just because a port is bound.
-    var up = state.dawAlive !== false && (state.tracks || []).length > 0;
+    // Dot + name reflect REAL liveness: alive means REAPER's feed heartbeat is
+    // live, or Cubase's MIDI Remote answered. An empty project (0 tracks) is
+    // still a live connection, so don't gate on tracks>0 (that hid a connected
+    // Cubase whose mixer hadn't pushed yet, showing a misleading "—").
+    var up = state.dawAlive !== false;
     $("#dot-reaper").classList.toggle("up", up);
     var t = $("#reaper-text");
     if (t) {
