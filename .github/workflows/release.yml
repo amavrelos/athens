@@ -27,9 +27,6 @@ jobs:
           - os: macos-15              # apple silicon -> Athens-<ver>-arm64.dmg
             build: sh scripts/build-macos.sh
             assets: dist/Athens-*.dmg
-          - os: macos-13              # intel -> Athens-<ver>-x86_64.dmg
-            build: sh scripts/build-macos.sh
-            assets: dist/Athens-*.dmg
           - os: windows-latest        # Inno installer, or portable zip fallback
             build: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
             assets: |
