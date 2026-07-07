@@ -1,0 +1,89 @@
+/* Athens — "cream lighting" edge-light overlay. Load AFTER app.css: additive
+   warm rim highlights/glows/bevels only — no layout or color-token changes. */
+
+:root {
+  --rim-warm: 253, 246, 228;      /* cream highlight rgb */
+  --rim-glow: 255, 236, 190;      /* warmer edge glow rgb */
+}
+
+/* --- the window itself: warm ambient bloom + crisp top rim --- */
+body {
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(var(--rim-glow), .55), transparent 55%),
+    var(--bg-desk);
+}
+#statusbar {
+  position: relative;
+  box-shadow:
+    inset 0 1px 0 rgba(var(--rim-warm), .9),
+    inset 0 -1px 0 rgba(0,0,0,.05),
+    0 1px 2px rgba(40,35,25,.06);
+}
+/* thin lit seam running along the very top edge of the app */
+#statusbar::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: linear-gradient(90deg,
+    transparent, rgba(var(--rim-glow), .95) 20%, rgba(var(--rim-glow), .95) 80%, transparent);
+  pointer-events: none;
+}
+
+/* --- panels: raked cream light on the top/left bevel --- */
+.panel {
+  position: relative;
+  box-shadow:
+    inset 0 1px 0 rgba(var(--rim-warm), .85),
+    inset 1px 0 0 rgba(var(--rim-warm), .35),
+    inset 0 -10px 22px rgba(120, 96, 48, .06),
+    var(--shadow-panel);
+}
+/* soft cream glow leaking from the top edge into the panel */
+.panel::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 40%;
+  border-radius: var(--r-panel) var(--r-panel) 0 0;
+  background: linear-gradient(180deg, rgba(var(--rim-glow), .18), transparent);
+  pointer-events: none; z-index: 0;
+}
+.panel > * { position: relative; z-index: 1; }
+
+/* knobs intentionally left unlit — see base restyle */
+
+/* --- hardware buttons: warm top-edge catch-light --- */
+.chipbtn, .portchip, .sbtn {
+  position: relative;
+}
+.chipbtn::before, .portchip::before, .sbtn:not(.lit)::before {
+  content: ""; position: absolute; left: 6px; right: 6px; top: 1px; height: 45%;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(var(--rim-warm), .55), transparent);
+  pointer-events: none;
+}
+
+/* --- segmented tab well: lit lip around the recess --- */
+.seg {
+  box-shadow:
+    inset 0 2px 4px rgba(0,0,0,.18),
+    inset 0 -1px 0 rgba(var(--rim-warm), .6),
+    0 1px 0 rgba(var(--rim-warm), .7);
+}
+
+/* --- footer: match the top seam, lit along its top edge --- */
+#footer {
+  box-shadow: inset 0 1px 0 rgba(var(--rim-warm), .7);
+}
+
+/* ---------- dark theme: cool the rim so it reads as sheen, not cream ---------- */
+[data-theme="dark"] {
+  --rim-warm: 236, 232, 246;
+  --rim-glow: 130, 120, 170;
+}
+[data-theme="dark"] body {
+  background:
+    radial-gradient(120% 90% at 50% -10%, rgba(var(--rim-glow), .28), transparent 55%),
+    var(--bg-desk);
+}
+[data-theme="dark"] .panel {
+  box-shadow:
+    inset 0 1px 0 rgba(var(--rim-warm), .10),
+    inset 1px 0 0 rgba(var(--rim-warm), .05),
+    var(--shadow-panel);
+}

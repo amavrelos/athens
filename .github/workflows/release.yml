@@ -1,0 +1,76 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: python -m pip install -e ".[midi,osc,ui,dev]"
+      - run: python -m pytest tests/ -q
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15              # apple silicon -> Athens-<ver>-arm64.dmg
+            build: sh scripts/build-macos.sh
+            assets: dist/Athens-*.dmg
+          - os: macos-13              # intel -> Athens-<ver>-x86_64.dmg
+            build: sh scripts/build-macos.sh
+            assets: dist/Athens-*.dmg
+          - os: windows-latest        # Inno installer, or portable zip fallback
+            build: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+            assets: |
+              dist/Athens-Setup-*.exe
+              dist/Athens-*-win.zip
+          - os: ubuntu-latest
+            build: sh scripts/build-linux.sh
+            assets: dist/Athens-*-linux-*.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Put Inno Setup on PATH (else the build ships the zip fallback)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $inno = "C:\Program Files (x86)\Inno Setup 6"
+          if (Test-Path "$inno\iscc.exe") { Add-Content $env:GITHUB_PATH $inno }
+      - run: python -m pip install -e ".[midi,osc,ui,package]"
+      - run: ${{ matrix.build }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.os }}
+          path: ${{ matrix.assets }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          merge-multiple: true
+      # draft: review the assets + write the notes, then press Publish
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: assets/*
+          draft: true

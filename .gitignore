@@ -1,0 +1,27 @@
+# build / tooling
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# private research material — lives on the local `research` branch ONLY
+# (vendor code, protocol captures, device backups); never on main
+reference/
+bringup/
+docs/ROTO-CONTROL-Serial-API-v1.2.pdf
+
+# packaging output — PyInstaller's throwaway auto-specs, but track our maintained one
+*.spec
+!Athens.spec
+
+# generated from packaging/Athens.iconset at build time
+packaging/Athens.icns

@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Athens</title>
+<link rel="stylesheet" href="tokens.css?v=53">
+<link rel="stylesheet" href="app.css?v=53">
+<link rel="stylesheet" href="edge-light.css?v=53">
+<script>
+/* set the theme before first paint (auto = follow macOS) — avoids a flash */
+(function(){try{var m=localStorage.getItem("theme")||"auto";var d=m==="dark"||(m==="auto"&&matchMedia("(prefers-color-scheme:dark)").matches);document.documentElement.dataset.theme=d?"dark":"light";if(/[?&]tb=merged/.test(location.search))document.documentElement.dataset.tb="merged";}catch(e){}})();
+</script>
+</head>
+<body>
+
+<header id="statusbar">
+  <span class="brand pywebview-drag-region">ATHENS</span>
+  <span class="connstack">
+    <span class="connrow" title="ROTO-CONTROL connection">
+      <i class="statusdot" id="dot-device" data-state="disconnected"></i>
+      <span class="conntext">ROTO</span>
+    </span>
+    <span class="connrow" title="DAW connection">
+      <i class="linkdot" id="dot-reaper"></i>
+      <span class="conntext" id="reaper-text">—</span>
+    </span>
+  </span>
+  <span class="facts mono" id="facts"></span>
+  <button class="portchip mono" id="chip-connect" title="connect to the device" hidden>connect ▸</button>
+  <span class="spacer"></span>
+  <nav class="seg" id="nav">
+    <button class="seg-btn active" data-view="live">Live</button>
+    <button class="seg-btn" data-view="plugin">Plugin</button>
+    <button class="seg-btn" data-view="device">Device</button>
+    <button class="seg-btn" data-view="setups">Setups</button>
+    <button class="seg-btn" data-view="library">Library</button>
+    <button class="seg-btn" data-view="settings">Settings</button>
+    <button class="seg-btn" data-view="diag" id="nav-diag" hidden>Diagnostics</button>
+  </nav>
+  <button class="chipbtn" id="btn-theme" title="toggle theme">◐</button>
+</header>
+
+<main id="main">
+
+  <!-- ============ LIVE ============ -->
+  <section class="view active" id="view-live">
+    <div class="panel rail-panel" id="panel-tracks">
+      <div class="panel-head">
+        <span class="caps">Tracks</span><span class="mono count" id="track-count">—</span>
+        <span class="spacer"></span><span class="mono hint" id="track-window"></span>
+      </div>
+      <div class="panel-body list" id="trackstrip"></div>
+      <div class="panel-foot hint">▎bar = on surface · click a row to select in the DAW</div>
+    </div>
+
+    <div class="panel grow" id="panel-surface">
+      <div class="panel-head">
+        <span class="caps">Bank</span>
+        <span class="mono" id="bank-desc">—</span>
+        <span class="spacer"></span>
+      </div>
+      <div class="panel-body surface">
+        <div id="knobs" class="knobgrid"></div>
+        <div class="btnrows">
+          <div class="btnrow" id="mute-row"></div>
+          <div class="btnrow" id="solo-row"></div>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ============ PLUGIN ============ -->
+  <section class="view" id="view-plugin">
+    <div class="panel rail-panel">
+      <div class="panel-head">
+        <span class="caps">FX chain</span>
+        <span class="spacer"></span><span class="mono hint" id="chain-track"></span>
+      </div>
+      <div class="panel-body list" id="fxchain"></div>
+      <div class="panel-foot hint">focused FX = the plugin on the device</div>
+    </div>
+
+    <div class="panel grow">
+      <div class="panel-head">
+        <span class="caps">Parameters</span>
+        <span class="mono" id="plugin-title">—</span>
+        <input class="search" id="param-search" placeholder="filter parameters…">
+        <span class="spacer"></span>
+        <span class="learnpill" id="learn-pill" data-state="off">LEARN OFF</span>
+      </div>
+      <div class="thead mono params-grid">
+        <span>#</span><span class="tl">NAME</span><span>VALUE</span><span></span><span>READOUT</span><span>KNOB</span>
+      </div>
+      <div class="panel-body table" id="paramtable"></div>
+      <div class="panel-foot hint" id="plugin-foot">arm LEARN on the device, then move a parameter in REAPER to map it</div>
+    </div>
+
+    <div class="panel rail-panel right">
+      <div class="panel-head"><span class="caps">Learn &amp; activity</span></div>
+      <div class="learnstate" id="learn-state">
+        <div class="learn-big" id="learn-big">idle</div>
+        <div class="hint" id="learn-detail">learn is armed from the hardware</div>
+        <div class="sweepbar" id="sweepbar" hidden><div class="sweepfill" id="sweepfill"></div></div>
+      </div>
+      <div class="panel-body list mono" id="learnfeed"></div>
+    </div>
+  </section>
+
+  <!-- ============ DEVICE (what the hardware knows) ============ -->
+  <section class="view" id="view-device">
+    <div class="panel rail-panel">
+      <div class="panel-head">
+        <span class="caps">Plugin maps</span>
+        <span class="mono count" id="devmap-count"></span>
+        <span class="spacer"></span>
+        <button class="chipbtn small" id="btn-devmaps-refresh">refresh</button>
+      </div>
+      <div class="panel-body list" id="devmaps"></div>
+      <div class="panel-foot hint">read from device flash — zero writes ·
+        these survive DAW &amp; app changes</div>
+    </div>
+
+    <div class="panel grow">
+      <div class="panel-head">
+        <span class="caps">Map contents</span>
+        <span class="mono" id="devmap-title">—</span>
+        <button class="chipbtn small" id="btn-devmap-rename" hidden
+                title="rename this map on the device">rename</button>
+      </div>
+      <div class="thead mono devmap-grid">
+        <span>CTL</span><span class="tl">DISPLAY NAME</span><span>PARAM #</span><span>RANGE</span><span>STEPS</span><span>COLOR</span>
+      </div>
+      <div class="panel-body table" id="devmap-controls"></div>
+      <div class="panel-foot hint" id="devmap-foot">select a map to inspect its learned controls</div>
+    </div>
+
+    <div class="panel rail-panel right">
+      <div class="panel-head"><span class="caps">Links</span>
+        <span class="spacer"></span>
+        <span class="mono hint" id="link-map-name"></span></div>
+      <div class="panel-body pad" id="linkpanel">
+        <p class="hint">plugins in your DAW appear here — link each to an on-device map (≈ = suggested match)</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SETUPS ============ -->
+  <section class="view" id="view-setups">
+    <div class="panel rail-panel">
+      <div class="panel-head">
+        <span class="caps">Setups</span><span class="mono count" id="setup-count">64</span>
+        <span class="spacer"></span>
+        <button class="iconbtn" id="btn-setup-import" title="Import setup JSON into selected slot">⤓</button>
+        <button class="iconbtn" id="btn-setup-export" title="Export selected setup">⤒</button>
+      </div>
+      <div class="panel-body list mono" id="setuplist"></div>
+      <div class="panel-foot hint">library is the source of truth ·<br>the device is a deployment target</div>
+    </div>
+
+    <div class="panel grow">
+      <div class="panel-head">
+        <span class="seg small" id="kindseg">
+          <button class="seg-btn active" data-kind="knob">Knobs 32</button>
+          <button class="seg-btn" data-kind="switch">Switches 32</button>
+        </span>
+        <input class="search" id="setup-search" placeholder="search name, CC…">
+        <span class="spacer"></span>
+        <span class="pagechips mono" id="pagechips"></span>
+      </div>
+      <div class="bulkbar" id="bulkbar">
+        <span class="caps">Bulk edit</span>
+        <span class="hint" id="bulk-hint">⇧click to select multiple rows — then set CH, MODE, COLOR once for all</span>
+        <span class="bulk-controls" id="bulk-controls" hidden>
+          <label>CH <input type="number" id="bulk-ch" min="1" max="16"></label>
+          <label>MODE <select id="bulk-mode"><option value="">—</option><option>CC7</option><option>CC14</option><option>NRPN7</option><option>NRPN14</option></select></label>
+          <label>COLOR <input type="number" id="bulk-colour" min="0" max="85"></label>
+          <button class="chipbtn small" id="bulk-apply">Apply to selection</button>
+        </span>
+      </div>
+      <div class="thead mono setup-grid">
+        <span>#</span><span></span><span class="tl">NAME</span><span>MODE</span><span>CH</span><span>CC/ADDR</span><span>MIN–MAX</span><span>HAPTIC</span><span></span>
+      </div>
+      <div class="panel-body table" id="controltable"></div>
+      <div class="panel-foot writebar">
+        <span id="write-status" class="hint"></span>
+        <span class="spacer"></span>
+        <button class="chipbtn" id="btn-activate"
+                title="make this slot the device's active setup">Activate on device</button>
+        <button class="chipbtn" id="btn-clear-slot"
+                title="wipe this slot in device flash (library copy stays)">Clear device slot…</button>
+        <button class="chipbtn primary" id="btn-deploy">Write to device</button>
+      </div>
+    </div>
+
+    <div class="panel inspector-panel">
+      <div class="panel-head">
+        <span class="caps" id="insp-title">Inspector</span>
+        <span class="mono hint" id="insp-sub"></span>
+        <span class="spacer"></span>
+        <span class="hint" id="touch-sync" title="touching a knob on the device selects its row">✳ touch-sync</span>
+      </div>
+      <div class="panel-body inspector" id="inspector">
+        <p class="hint">select a control</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ LIBRARY ============ -->
+  <section class="view" id="view-library">
+    <div class="panel grow">
+      <div class="panel-head">
+        <span class="caps">Local library</span>
+        <span class="spacer"></span>
+        <button class="chipbtn primary" id="btn-dump">Snapshot device → library</button>
+      </div>
+      <div class="panel-body list" id="liblist"></div>
+      <div class="panel-foot hint">snapshotting reads the whole device — zero flash writes · requires the serial connection</div>
+    </div>
+    <div class="panel grow">
+      <div class="panel-head"><span class="caps">Import / export</span>
+        <span class="hint">official-app compatible JSON</span></div>
+      <div class="panel-body pad">
+        <textarea id="lib-json" class="mono jsonbox" rows="16" spellcheck="false"
+          placeholder="Export a setup here, or paste JSON to import…"></textarea>
+        <div class="row gap">
+          <label class="hint">into slot
+            <input id="lib-slot" class="numinput" type="number" min="0" max="63" value="7"></label>
+          <button class="chipbtn" id="btn-import">Import</button>
+          <span id="lib-msg" class="hint"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SETTINGS ============ -->
+  <section class="view" id="view-settings">
+    <div class="settings-scroll">
+
+      <div class="settings-col">
+        <div class="panel">
+          <div class="panel-head">
+            <span class="caps">Who drives who</span>
+            <span class="spacer"></span>
+            <span class="hint">mode changes between the device and the app</span>
+          </div>
+          <div class="panel-body pad">
+            <div class="seg" id="follow-seg">
+              <button class="seg-btn" data-follow="device"
+                      title="the hardware picks the app view">roto ▸ app</button>
+              <button class="seg-btn" data-follow="app"
+                      title="clicking Live/Plugin flips the hardware screen">app ▸ roto</button>
+              <button class="seg-btn" data-follow="off"
+                      title="independent">off</button>
+            </div>
+            <p class="hint" id="follow-hint"></p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span class="caps">Mix mode</span>
+            <span class="spacer"></span>
+            <span class="hint">how the knobs behave in the mixer</span>
+          </div>
+          <div class="panel-body pad" id="mix-settings"></div>
+          <div class="panel-foot hint">off = touching/turning a volume knob leaves
+            REAPER's selection alone · on = touching a strip selects its track
+            (like Logic) · track-select mode always changes selection</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span class="caps">System control</span>
+            <span class="spacer"></span>
+            <span class="hint">use the ROTO with no DAW — Mac volume, cursor knob, media keys</span>
+          </div>
+          <div class="panel-body pad" id="system-settings"></div>
+          <div class="panel-foot hint">off = pure DAW use, nothing is probed and
+            macOS never asks for permissions · on = permissions are checked at
+            startup · run with <span class="mono">--daw system</span> to use it</div>
+        </div>
+      </div>
+
+      <div class="settings-col">
+        <div class="panel">
+          <div class="panel-head">
+            <span class="caps">Transport buttons</span>
+            <span class="mono hint" id="transport-daw"></span>
+            <span class="spacer"></span>
+            <span class="hint">the firmware grid — labels are per-DAW, actions are yours</span>
+          </div>
+          <div class="panel-body pad" id="transport-settings"></div>
+          <div class="panel-foot hint">the last four are assignable — the three
+            unlabeled buttons exist on the hardware but Logic never used them</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <span class="caps">DAW scripts</span>
+            <span class="spacer"></span>
+            <span class="hint">installed automatically — Locate only if your host is in a non-standard folder</span>
+          </div>
+          <div class="panel-body pad" id="script-settings"></div>
+          <div class="panel-foot hint">Athens keeps the REAPER &amp; Cubase companion
+            scripts current on launch. After an update, reload in the DAW (Cubase:
+            Scripts refresh · REAPER: run the action).</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ============ DIAGNOSTICS ============ -->
+  <section class="view" id="view-diag">
+    <div class="panel rail-panel" id="panel-params">
+      <div class="panel-head">
+        <span class="caps">Plugin params</span>
+        <span class="spacer"></span>
+        <span class="hint">device knob sweep</span>
+      </div>
+      <div class="panel-body mono" id="param-diag"></div>
+    </div>
+
+    <div class="panel grow">
+      <div class="panel-head">
+        <span class="caps">Translation</span>
+        <button class="chipbtn small" id="btn-pause">pause</button>
+        <span class="hint" id="feed-count"></span>
+        <span class="spacer"></span>
+        <span class="hint">Cubase ▸ Athens ▸ ROTO-Control · hover a row for the raw hex</span>
+      </div>
+      <div class="thead mono" style="white-space:nowrap">
+        <span style="display:inline-block;width:16em">CUBASE</span>
+        <span style="display:inline-block;width:2em"></span>
+        <span style="display:inline-block;width:16em">ROTO-CONTROL</span>
+        <span style="display:inline-block;width:12em">COMMENT</span>
+      </div>
+      <div class="panel-body mono" id="trace" style="overflow-x:auto"></div>
+    </div>
+
+    <div class="panel rail-panel right" id="panel-activity">
+      <div class="panel-head">
+        <span class="caps">Activity</span>
+        <span class="spacer"></span>
+        <button class="chipbtn small" id="btn-act-pause">pause</button>
+      </div>
+      <div class="panel-body list mono" id="activity"></div>
+    </div>
+  </section>
+</main>
+
+<footer id="footer">
+  <span id="foot-status">connecting…</span>
+  <span class="spacer"></span>
+  <span class="mono faint" id="foot-ws"></span>
+</footer>
+
+<script src="palette.js?v=53"></script>
+<script src="app.js?v=53"></script>
+</body>
+</html>

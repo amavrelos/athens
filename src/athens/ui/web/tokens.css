@@ -1,0 +1,166 @@
+/* roto-reaper — theme tokens. :root carries light; [data-theme="dark"] overrides. */
+
+:root {
+  /* --- surfaces --- */
+  --bg-desk: #ece6d4;          /* window background — Model 73 cream (lightened) */
+  --surface: #f6f1e4;          /* panel — warm off-white, lifts off the cream */
+  --surface-hi: #fbf8ef;       /* elevated: selected row, inputs, chips */
+  --surface-lo: #e3dcc5;       /* recessed: page headers, table group bars */
+  --surface-hint: #f0ebdc;     /* idle hint bars (bulk edit), writing rows */
+
+  /* --- strokes --- */
+  --border: #d8cfb9;           /* panel outline */
+  --border-seam: #e6ddc9;      /* internal panel dividers */
+  --border-input: #cec3aa;     /* inputs, chips, buttons */
+  --border-subtle: #e0d6bf;    /* tile outlines */
+
+  /* --- chrome gradients --- */
+  --bar-top: linear-gradient(#f8f4e9, #ece6d4);   /* status bar */
+  --bar-bottom: linear-gradient(#f0ebdc, #e8e1cc);/* footer */
+  --btn-primary: linear-gradient(#33291c, #1d1812);
+  --btn-primary-ink: #f6f1e4;
+
+  /* --- text --- */
+  --ink: #2a2118;
+  --text-2: #514737;
+  --muted: #6a6150;
+  --faint: #98907a;
+  --disabled: #d5d0c4;
+
+  /* --- semantic --- */
+  --ok: #2f9e5f;
+  --ok-strong: #2f7d4f;
+  --dirty: #a86a12;            /* unsaved marker */
+  --error: #8f3c34;
+  --error-bg: #faeceb;
+  --error-border: #d9a8a2;
+  --selecting: #1a5cc8;        /* focus rings, inline-edit outline */
+
+  /* --- shadows --- */
+  --shadow-panel: inset 0 1px 0 #fff, 0 1px 3px rgba(40,35,25,.08);
+  --shadow-input: inset 0 1px 2px rgba(40,35,25,.08);
+  --shadow-row-selected: 0 1px 4px rgba(40,35,25,.16);
+  --shadow-btn-primary: 0 2px 4px rgba(40,35,25,.25), inset 0 1px 0 rgba(255,255,255,.15);
+
+  /* device palette: indexed RENDER values (stored value is always the colour
+     INDEX). These 13 are the MIDI-mode quick row. PLACEHOLDER — replace with the
+     real device palette dump. */
+  --dev-red: #d64545;
+  --dev-orange: #d97b2f;
+  --dev-amber: #e8a33d;
+  --dev-yellow: #b6b52e;
+  --dev-green: #3d9960;
+  --dev-teal: #2f9e8f;
+  --dev-sky: #3a8fd0;
+  --dev-blue: #1a5cc8;
+  --dev-purple: #8a63d2;
+  --dev-pink: #c74f9e;
+  --dev-white: #f6f4ef;
+  --dev-grey: #8f8a7e;
+  --dev-black: #26241f;
+
+  /* --- LED glows (colour-matched, use with device palette) --- */
+  --glow-alpha: .5;
+
+  /* --- Model 73 hardware (icon-derived) --- */
+  --font-brand: Futura, 'Trebuchet MS', Helvetica, sans-serif;
+  --knob-skirt: repeating-conic-gradient(#141414 0deg 7.5deg, #2e2e2e 7.5deg 15deg);
+  --knob-cap: radial-gradient(circle at 35% 30%, #4c4c4c, #161616 70%);
+  --knob-pointer: #f6f1e4;
+  --btn-raised: linear-gradient(#faf7ee, #e8e1cc);
+  --btn-raised-edge: #c9c0a6;
+  --well: linear-gradient(#e3dcc5, #ede7d6);
+
+  /* --- type --- */
+  --font-ui: 'Helvetica Neue', Helvetica, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --fs-caps-label: 600 10px/1.2 var(--font-ui);   /* letter-spacing .1em, uppercase */
+  --fs-data: 400 12px/1.4 var(--font-mono);       /* tabular-nums */
+  --fs-control: 600 12.5px/1.3 var(--font-ui);
+  --fs-body: 400 13px/1.45 var(--font-ui);
+  --fs-value: 400 12px/1.3 var(--font-mono);      /* ALWAYS fixed-width containers */
+
+  /* --- space (px) --- */
+  --sp-1: 2px;  --sp-2: 4px;  --sp-3: 6px;  --sp-4: 8px;
+  --sp-5: 10px; --sp-6: 12px; --sp-7: 16px;
+
+  /* --- radii --- */
+  --r-input: 6px;
+  --r-chip: 7px;
+  --r-button: 8px;
+  --r-panel: 10px;
+  --r-pill: 20px;
+
+  /* --- layout --- */
+  --window-default: 1200px 760px;
+  --window-min: 960px 640px;
+  --rail-w: 186px;
+  --inspector-w: 296px;
+  --tracks-w: 224px;
+  --feed-w: 250px;
+  --statusbar-h: 52px;
+  --footer-h: 48px;
+}
+
+[data-theme="dark"] {
+  /* deep purple-charcoal: blue channel leads so neutrals read cool/near-black */
+  --bg-desk: #141218;
+  --surface: #1c1a24;
+  --surface-hi: #262231;
+  --surface-lo: #262231;
+  --surface-hint: #181722;
+
+  --border: #332f40;
+  --border-seam: #2a2735;
+  --border-input: #423e52;
+  --border-subtle: #332f40;
+
+  --bar-top: linear-gradient(#241f30, #1b1826);
+  --bar-bottom: linear-gradient(#201d2b, #191622);
+  --btn-primary: linear-gradient(#f4f2f8, #dad6e6);  /* inverted primary */
+  --btn-primary-ink: #141218;
+
+  /* lifted for readability on real displays */
+  --ink: #f2f0f6;
+  --text-2: #d4d0de;
+  --muted: #a29eb0;
+  --faint: #6b6779;
+  --disabled: #3a3648;
+
+  --ok: #4fae74;
+  --ok-strong: #4fae74;
+  --dirty: #f0b04b;
+  --error: #d97b73;
+  --error-bg: #2c1d1b;
+  --error-border: #5a3a36;
+  --selecting: #54a4e0;
+
+  --knob-skirt: repeating-conic-gradient(#0c0b10 0deg 7.5deg, #262230 7.5deg 15deg);
+  --knob-cap: radial-gradient(circle at 35% 30%, #3e3a4c, #141218 70%);
+  --knob-pointer: #f2f0f6;
+  --btn-raised: linear-gradient(#2b2738, #201d2b);
+  --btn-raised-edge: #0d0c12;
+  --well: linear-gradient(#181722, #221f2e);
+
+  --shadow-panel: inset 0 1px 0 rgba(255,255,255,.04), 0 1px 3px rgba(0,0,0,.4);
+  --shadow-input: inset 0 1px 2px rgba(0,0,0,.4);
+  --shadow-row-selected: 0 1px 4px rgba(0,0,0,.4);
+  --shadow-btn-primary: 0 2px 5px rgba(0,0,0,.4);
+
+  /* device palette — brightened for dark surfaces; same indices */
+  --dev-red: #e05a5a;
+  --dev-orange: #e08a44;
+  --dev-amber: #f0b04b;
+  --dev-yellow: #c4c23c;
+  --dev-green: #4fae74;
+  --dev-teal: #3db3a2;
+  --dev-sky: #54a4e0;
+  --dev-blue: #4a83e0;
+  --dev-purple: #9d77e0;
+  --dev-pink: #d666b0;
+  --dev-white: #ece8dd;
+  --dev-grey: #8f8a7e;
+  --dev-black: #0d0d0b;
+
+  --glow-alpha: .6;
+}
