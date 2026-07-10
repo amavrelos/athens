@@ -138,7 +138,7 @@ class _FakeRoto:
 
 def test_device_map_edit_clamps_to_flash_bounds():
     # out-of-range editor input (steps=10000, min=-5, ...) must be clamped
-    # before it reaches device flash — values are 14-bit, detents 0 or 2-10
+    # before it reaches device flash — knob min/max are 16-bit, detents 0 or 2-10
     from athens.protocol.codec import PluginKnobConfig
 
     svc = _real_service()
@@ -155,7 +155,7 @@ def test_device_map_edit_clamps_to_flash_bounds():
     assert r["result"]["written"] is True
     assert svc.roto.written                      # the write really went out
     assert cfg.steps == 10 and cfg.min_value == 0
-    assert cfg.max_value == 16383 and cfg.colour == 127
+    assert cfg.max_value == 65535 and cfg.colour == 127   # 16-bit range
     assert cfg.name == "ABCDEFGHIJKL"            # 12-char display budget
 
     # a single detent is meaningless: coerced up to the smallest legal count

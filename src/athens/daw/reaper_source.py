@@ -64,6 +64,14 @@ _FEED_GRACE_S = 3.0
 # 8 knobs. NEVER over-request: REAPER throttles OSC output to ~1 msg/130ms, so
 # a padded bank is seconds of drip-fed feedback that stalls track selection.
 _DEFAULT_BANK = 8
+# REAPER liveness: any inbound OSC keeps the DAW "alive"; this long with NO OSC
+# and no feed heartbeat == REAPER is gone (its VU/feedback stream stops the
+# instant it quits). Matches the feed's own gone timeout.
+_OSC_GONE_S = 4.0
+# after start(), give REAPER this long to say anything before total silence is
+# read as "not running" — covers a slow launch + OSC's throttled first dump.
+# Without it, a source that just started would blank before REAPER could speak.
+_LIVE_GRACE_S = 5.0
 
 
 def _parts(address: str) -> list:
@@ -106,6 +114,15 @@ class ReaperSysexSource(SysexDawSource):
         self._feed_active = False                  # feed has delivered data
         self._feed_start = 0.0                      # when the feed started (grace)
         self._requested_count: Optional[int] = None  # last /device/track/count sent
+        # -- liveness: combined feed-heartbeat OR recent OSC --
+        self._last_osc = 0.0                        # monotonic of last inbound OSC
+        self._feed_alive = False                    # feed heartbeat edge state
+        self._alive_pub = True                      # published alive (optimistic
+        #                                             at start, matches service)
+        self._live_start = 0.0                      # start() time, for the grace
+        self._live_stop = threading.Event()
+        self._live_timer: Optional[threading.Timer] = None
+        self._alive_lock = threading.Lock()         # serialises the alive edge
         if enable_fx_feed:
             self._feed = ReaperFxFeed(fx_feed_dir)
             self._feed.on_chain = self._on_feed_chain
@@ -113,12 +130,21 @@ class ReaperSysexSource(SysexDawSource):
             self._feed.on_values = self._on_feed_values
             self._feed.on_track_count = self._on_feed_track_count
             self._feed.on_daw_alive = self._on_feed_daw_alive
+            self._feed.on_script_version = \
+                lambda v: self.on_script_version and self.on_script_version(v)
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
         if self._server is not None:
             return          # idempotent: the service starts the source at app
         #                     launch AND the bridge start()s it again on attach
+        # liveness poller: one, even if python-osc is missing (then start() is
+        # not _server-idempotent). Grace starts now so a silent REAPER isn't
+        # declared gone before it has had a chance to speak.
+        if self._live_timer is None:
+            self._live_start = time.monotonic()
+            self._live_stop.clear()
+            self._schedule_live_poll()
         # the ReaScript FX feed works even without python-osc, so start it first
         if self._feed is not None:
             self._feed_start = time.monotonic()
@@ -133,26 +159,36 @@ class ReaperSysexSource(SysexDawSource):
             return
         self._client = SimpleUDPClient(*self._osc_send)
         d = Dispatcher()
-        d.map("/track/*/name", self._on_name)
-        d.map("/track/*/volume", self._on_volume)
-        d.map("/track/*/pan", self._on_pan)
-        d.map("/track/*/send/*/volume", self._on_send)
-        d.map("/track/*/mute", lambda a, *v: self._on_flag("muted", a, *v))
-        d.map("/track/*/solo", lambda a, *v: self._on_flag("soloed", a, *v))
-        d.map("/track/*/recarm", lambda a, *v: self._on_flag("armed", a, *v))
-        d.map("/track/*/monitor", lambda a, *v: self._on_flag("monitoring", a, *v))
-        d.map("/track/*/vu", self._on_vu)
-        d.map("/track/*/vu/L", lambda a, *v: self._on_vu_side(0, a, *v))
-        d.map("/track/*/vu/R", lambda a, *v: self._on_vu_side(1, a, *v))
-        d.map("/track/*/select", self._on_select)
+
+        # any inbound OSC (even an address we don't map — /time, /tempo, VU)
+        # means REAPER is alive right now, so tap the liveness mtime on the way
+        # to the real handler. One wrapper here beats a bump in every handler.
+        def live(fn):
+            def wrapped(addr, *a):
+                self._seen_osc()
+                return fn(addr, *a)
+            return wrapped
+
+        d.map("/track/*/name", live(self._on_name))
+        d.map("/track/*/volume", live(self._on_volume))
+        d.map("/track/*/pan", live(self._on_pan))
+        d.map("/track/*/send/*/volume", live(self._on_send))
+        d.map("/track/*/mute", live(lambda a, *v: self._on_flag("muted", a, *v)))
+        d.map("/track/*/solo", live(lambda a, *v: self._on_flag("soloed", a, *v)))
+        d.map("/track/*/recarm", live(lambda a, *v: self._on_flag("armed", a, *v)))
+        d.map("/track/*/monitor", live(lambda a, *v: self._on_flag("monitoring", a, *v)))
+        d.map("/track/*/vu", live(self._on_vu))
+        d.map("/track/*/vu/L", live(lambda a, *v: self._on_vu_side(0, a, *v)))
+        d.map("/track/*/vu/R", live(lambda a, *v: self._on_vu_side(1, a, *v)))
+        d.map("/track/*/select", live(self._on_select))
         # closures, NOT map() extras: python-osc wraps extras in a list
-        d.map("/play", lambda a, *v: self._on_transport("playing", *v))
-        d.map("/record", lambda a, *v: self._on_transport("recording", *v))
-        d.map("/repeat", lambda a, *v: self._on_transport("loop", *v))
-        d.map("/track/*/fx/*/name", self._on_fx_name)
-        d.map("/track/*/fx/*/fxparam/*/name", self._on_fxparam_name)
-        d.map("/track/*/fx/*/fxparam/*/value", self._on_fxparam_value)
-        d.set_default_handler(lambda a, *v: None)
+        d.map("/play", live(lambda a, *v: self._on_transport("playing", *v)))
+        d.map("/record", live(lambda a, *v: self._on_transport("recording", *v)))
+        d.map("/repeat", live(lambda a, *v: self._on_transport("loop", *v)))
+        d.map("/track/*/fx/*/name", live(self._on_fx_name))
+        d.map("/track/*/fx/*/fxparam/*/name", live(self._on_fxparam_name))
+        d.map("/track/*/fx/*/fxparam/*/value", live(self._on_fxparam_value))
+        d.set_default_handler(live(lambda a, *v: None))
         self._server = ThreadingOSCUDPServer(self._osc_recv, d)
         threading.Thread(target=self._server.serve_forever, daemon=True,
                          name="reaper-osc").start()
@@ -177,6 +213,10 @@ class ReaperSysexSource(SysexDawSource):
         self._client.send_message("/action", 41743)
 
     def stop(self) -> None:
+        self._live_stop.set()
+        if self._live_timer is not None:
+            self._live_timer.cancel()
+            self._live_timer = None
         if self._feed is not None:
             self._feed.stop()
         if self._tracks_timer is not None:
@@ -240,19 +280,85 @@ class ReaperSysexSource(SysexDawSource):
         so the user knows to load roto_fx_feed.lua."""
         return getattr(self, "_feed_active", False)
 
+    # -- liveness: REAPER is alive if the feed beats OR OSC is flowing ----------
+    def _seen_osc(self) -> None:
+        """Any inbound OSC = REAPER is speaking right now. Also lights the alive
+        edge immediately so a returning REAPER re-appears without waiting for
+        the next poll."""
+        self._last_osc = time.monotonic()
+        if not self._alive_pub:
+            self._apply_alive(True)
+
+    def _osc_fresh(self) -> bool:
+        return (self._last_osc > 0.0
+                and time.monotonic() - self._last_osc < _OSC_GONE_S)
+
+    def check_alive(self, timeout: float = 0.0) -> bool:
+        """Is REAPER answering right now — feed heartbeat OR fresh OSC. Free
+        (timestamp reads, no I/O), so the DAW auto-monitor can consult the
+        ACTIVE source instead of only the heartbeat file: an OSC-only setup
+        (Lua feed not loaded) must read as live or the monitor would yank the
+        session (its promise: never swap away from a live DAW)."""
+        return self._feed_alive or self._osc_fresh()
+
+    def _apply_alive(self, alive: bool) -> None:
+        """The single owner of the published REAPER-alive state. On the gone
+        edge it forgets the whole session (tracks()/devices() empty and the
+        bridge, via on_daw_alive False, blanks the device); fires on_daw_alive
+        only on a real change. Serialised so the poll and the feed edge can't
+        double-fire."""
+        with self._alive_lock:
+            if alive == self._alive_pub:
+                return
+            self._alive_pub = alive
+            # side effects INSIDE the lock: flag flip, session wipe and edge
+            # delivery form one atomic edge. Outside it, a gone-edge (poll
+            # timer thread) and an alive-edge (OSC handler thread) could
+            # interleave into "session wiped + last edge False while
+            # _alive_pub is True" — a blanked device no OSC packet can heal
+            # (_seen_osc only fires the edge on a False->True transition).
+            # Ordering is _alive_lock -> _lock (via _clear_session); no caller
+            # holds _lock when entering here (the OSC live() tap runs BEFORE
+            # its handler takes _lock), so this cannot deadlock. The callbacks
+            # are queue-puts / bus publishes — non-blocking.
+            if not alive:
+                self._clear_session()
+            if self.on_daw_alive:
+                self.on_daw_alive(alive)
+
+    def _clear_session(self) -> None:
+        with self._lock:
+            self._names.clear(); self._volumes.clear(); self._pans.clear()
+            self._sends.clear(); self._flags.clear(); self._vu.clear()
+            self._fx.clear(); self._track_count = 0
+            self._touched = None
+
+    def _schedule_live_poll(self) -> None:
+        self._live_timer = threading.Timer(1.5, self._live_poll)
+        self._live_timer.daemon = True
+        self._live_timer.start()
+
+    def _live_poll(self) -> None:
+        """Reconcile alive from the free signals every 1.5 s. A silent REAPER
+        (no feed heartbeat AND no OSC — it quit, or was never there) flips to
+        gone once the start-up grace passes. This is exactly what the feed's own
+        'never declare gone before the first beat' guard can't catch for an
+        OSC-only setup: the phantom-alive REAPER with stale tracks."""
+        try:
+            if time.monotonic() - self._live_start > _LIVE_GRACE_S:
+                self._apply_alive(self._feed_alive or self._osc_fresh())
+        except Exception:  # noqa: BLE001 - a poll glitch must not kill the timer
+            log.debug("reaper live-poll tick failed", exc_info=True)
+        finally:
+            if not self._live_stop.is_set():
+                self._schedule_live_poll()
+
     def _on_feed_daw_alive(self, alive: bool) -> None:
-        """REAPER appeared / disappeared (feed heartbeat edge). On gone,
-        forget the whole session so tracks()/devices() go empty; the bridge
-        (on_daw_alive False) blanks the device. On return, the bridge
-        refreshes and REAPER re-sends its state via OSC."""
-        if not alive:
-            with self._lock:
-                self._names.clear(); self._volumes.clear(); self._pans.clear()
-                self._sends.clear(); self._flags.clear(); self._vu.clear()
-                self._fx.clear(); self._track_count = 0
-                self._touched = None
-        if self.on_daw_alive:
-            self.on_daw_alive(alive)
+        """Feed heartbeat edge. Feed alive => REAPER alive; feed gone only
+        blanks if OSC has ALSO fallen silent (REAPER itself is gone), so a
+        stopped feed script under a still-open REAPER keeps the mixer live."""
+        self._feed_alive = alive
+        self._apply_alive(alive or self._osc_fresh())
 
     def selected_track(self) -> int:
         return self._selected

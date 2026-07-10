@@ -40,6 +40,7 @@ class Transport(Protocol):
     """Minimal interface the RotoControl client depends on."""
 
     on_async: Optional[AsyncHandler]
+    on_disconnect: Optional[Callable[[], None]]   # fired once if the link drops
 
     def request(self, frame: bytes, resp_data_len: int = 0,
                 timeout: float = 2.0) -> codec.Response: ...
@@ -52,6 +53,7 @@ class SerialTransport:
         import serial  # imported lazily so the package imports without pyserial
 
         self.on_async: Optional[AsyncHandler] = None
+        self.on_disconnect: Optional[Callable[[], None]] = None   # link dropped
         self._ser = serial.Serial(
             port=port, baudrate=BAUDRATE, bytesize=BYTESIZE,
             parity=PARITY, stopbits=STOPBITS, timeout=0.2,
@@ -107,6 +109,7 @@ class SerialTransport:
         return bytes(buf)
 
     def _read_loop(self) -> None:
+        import serial
         while not self._closing.is_set():
             try:
                 b0 = self._ser.read(1)
@@ -118,7 +121,23 @@ class SerialTransport:
                     self._read_response()
                 else:
                     log.warning("resync: dropping stray byte 0x%02X", b0[0])
-            except Exception:  # pragma: no cover - keep the reader alive
+            except serial.SerialException as exc:
+                # TERMINAL: the ROTO's serial port is gone (USB unplug / power).
+                # A removed device fails read() forever, so do NOT keep looping —
+                # that spins thousands of times a second, floods the log and
+                # wedges the app. Stop the reader and signal a disconnect so the
+                # service detaches cleanly (and the MIDI/state pushes stop too).
+                if not self._closing.is_set():
+                    log.warning("serial link lost (%s) — stopping reader", exc)
+                    self._closing.set()
+                    cb = self.on_disconnect
+                    if cb is not None:
+                        try:
+                            cb()
+                        except Exception:      # noqa: BLE001 - never re-raise here
+                            log.exception("on_disconnect handler failed")
+                return
+            except Exception:  # transient parse/dispatch glitch — keep going
                 if not self._closing.is_set():
                     log.exception("serial reader error")
 
@@ -155,6 +174,7 @@ class LoopbackTransport:
 
     def __init__(self, canned: Optional[dict] = None):
         self.on_async: Optional[AsyncHandler] = None
+        self.on_disconnect: Optional[Callable[[], None]] = None
         self.sent: list[bytes] = []
         # canned: {(type, subtype): data_bytes} returned as the response payload
         self._canned = canned or {}

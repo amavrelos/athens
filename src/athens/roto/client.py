@@ -27,6 +27,11 @@ class RotoControl:
         self._t = transport
         self._midi = midi
         self._t.on_async = self._dispatch_async
+        # serial link dropped (unplug) -> forward to the owner (the service
+        # auto-detaches). Set by the transport reader; late-bound so the owner
+        # can assign self.on_disconnect after construction.
+        self.on_disconnect: Optional[Callable[[], None]] = None
+        self._t.on_disconnect = self._on_transport_lost
         if self._midi is not None:
             self._midi.on_value = self._on_midi_value
 
@@ -98,6 +103,10 @@ class RotoControl:
             self._midi.send_nrpn(channel, controller, value, bits)
         else:
             self._midi.send_cc(channel, controller, value, bits)
+
+    def _on_transport_lost(self) -> None:
+        if self.on_disconnect is not None:
+            self.on_disconnect()
 
     def close(self) -> None:
         self._t.close()
