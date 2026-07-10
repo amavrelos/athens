@@ -69,6 +69,15 @@ class BridgeService:
         self._daw_mode = daw            # which companion scripts to keep current
         self._active_daw = getattr(self.source, "DAW_NAME", "DAW").lower()
         self._daw_lock = threading.Lock()
+        # ROTO attach/detach is driven from three threads (the hot-plug poller,
+        # the connect/disconnect RPCs, and the serial reader's device-lost) —
+        # serialise them so an attach and a detach can't interleave.
+        self._attach_lock = threading.Lock()
+        # a MANUAL disconnect suppresses the hot-plug poller until the user
+        # connects again; an involuntary unplug does NOT set it (replug should
+        # reconnect on its own).
+        self._user_disconnected = False
+        self._ac_waiting = False    # logged the "watching for ROTO" note once
         self.port: Optional[MidiPort] = None
         self.client: Optional[RotoLogicClient] = None
         self.bridge = None      # LogicBridge, created on connect
@@ -77,6 +86,11 @@ class BridgeService:
         self._connected_at = 0.0
         self._device_mode = ""  # last mode the hardware announced
         self._daw_alive = True  # False once the DAW's feed heartbeat stops
+        # auto-swap: a Cubase source kept open from startup (pre-flood) so the
+        # monitor can confirm Cubase on its OWN already-open port and swap to it
+        # — a runtime MIDI open would deadlock the flooding device port. None
+        # unless --daw auto stands one up (and it IS self.source when on Cubase).
+        self._cubase = None
         self._started = False
 
         # library_path: the app entrypoints pass the persistent location
@@ -92,6 +106,14 @@ class BridgeService:
         # only keeps a 12-char display name
         self._param_refs_path = None
         self._param_refs: dict = {}
+        self._device_map_ids: dict = {}   # plugin hex -> {param_index: hash6}
+        #                                   (device-map identity cache; serial
+        #                                   reads are slow — see _device_map_identity)
+        self._script_stale: dict = {}     # daw(lower) -> {daw, loaded, expected}:
+        #                                   the host runs an OLDER companion script.
+        #                                   STATE, not just an event — the check can
+        #                                   fire ms after launch, before any UI is
+        #                                   connected to hear a one-shot notice.
         self._pending_learn_ref: Optional[dict] = None
         # user settings (assignable transport buttons, ...) — the bridge
         # applies them, so they live app-side, not in the web UI
@@ -124,6 +146,11 @@ class BridgeService:
         # attaching the device later (connect) re-chains these taps
         self._tap_source_events()
         self.source.start()
+        # auto mode: stand the Cubase watcher up NOW — before the device port
+        # opens and floods — so the monitor can later confirm a live Cubase on
+        # its own already-open port and swap to it (a runtime MIDI open deadlocks).
+        if self._auto_daw:
+            self._start_cubase_watch()
         if self._auto:
             # the ROTO is possibly already plugged in — connect without
             # making the user click anything
@@ -204,6 +231,7 @@ class BridgeService:
             try:
                 from ..roto.transport import SerialTransport
                 roto = RotoControl(SerialTransport(dev))
+                roto.on_disconnect = self._on_device_lost
                 fw = str(roto.firmware_version())
                 self._attach_serial(roto)
                 log.info("serial attached: %s (fw %s)", dev, fw)
@@ -217,25 +245,63 @@ class BridgeService:
                         pass
         return None
 
-    def _auto_connect(self) -> None:
+    @staticmethod
+    def _roto_midi_present() -> bool:
+        """A real ROTO-CONTROL MIDI input is present — but NOT the Cubase bridge
+        pair ("...roto-bridge"), which the device client must never bind (it
+        would drown in the DAW contract's frames)."""
         try:
             import mido
-            # match the real device ("ROTO-CONTROL") but NOT the Cubase bridge
-            # pair ("...roto-bridge") — else the device client binds the bridge
-            # port and drowns in the DAW contract's frames.
-            if not any("roto" in n.lower() and "bridge" not in n.lower()
-                       for n in mido.get_input_names()):
-                log.info("auto-connect: no ROTO MIDI port; waiting for manual")
-                return
+            return any("roto" in n.lower() and "bridge" not in n.lower()
+                       for n in mido.get_input_names())
+        except Exception:      # noqa: BLE001 - no midi extra / enumeration hiccup
+            return False
+
+    def _auto_connect(self) -> None:
+        """Attach the ROTO when it's present — at launch AND whenever it later
+        (re)appears. A poll, so hot-plugging the device after launch, or
+        replugging after an unplug, connects with no click. A manual disconnect
+        suppresses it until the user connects again."""
+        import time
+        while self._started:
+            try:
+                self._auto_connect_tick()
+            except Exception as exc:  # noqa: BLE001 - log, retry on the next tick
+                log.warning("auto-connect attach failed: %s", exc)
+            time.sleep(2.0)
+
+    def _auto_connect_tick(self) -> bool:
+        """One hot-plug attempt. Attaches (and returns True) only while DETACHED
+        (bridge is None — no live flood to deadlock CoreMIDI against), the user
+        hasn't manually disconnected, and a real ROTO port is present. Serialised
+        against detach / connect on the attach lock."""
+        with self._attach_lock:
+            if self._user_disconnected:
+                return False
+            if self.bridge is not None:
+                # MIDI is up; serial may have LAGGED the hot-plug (CoreMIDI
+                # publishes the port before the CDC /dev/tty node exists) —
+                # keep retrying serial until it answers, or it would stay
+                # unattached for the whole session (maps/learn dead).
+                if self.roto is None and self._roto_midi_present() \
+                        and self._attach_best_serial(
+                            self._serial_candidates()) is not None:
+                    log.info("auto-connect: serial attached (lagged hot-plug)")
+                    return True
+                return False
+            if not self._roto_midi_present():
+                if not self._ac_waiting:
+                    log.info("auto-connect: no ROTO yet — watching for it")
+                    self._ac_waiting = True
+                return False
             from ..roto.sysex_client import MidoMidiPort
             self._attach_midi(MidoMidiPort())
-            log.info("auto-connect: MIDI attached")
-        except Exception as exc:  # noqa: BLE001 - stay silent, manual retry works
-            log.warning("auto-connect MIDI failed: %s", exc)
-            return
-        if self._attach_best_serial(self._serial_candidates()) is None:
-            log.warning("auto-connect: no serial candidate answered "
-                        "(device maps unavailable until it does)")
+            log.info("auto-connect: ROTO attached")
+            if self._attach_best_serial(self._serial_candidates()) is None:
+                log.warning("auto-connect: no serial candidate answered "
+                            "(device maps unavailable until it does)")
+            self._ac_waiting = False
+            return True
 
     def stop(self) -> None:
         # idempotent: runs from the UI's finally, atexit, AND signal handlers,
@@ -251,6 +317,14 @@ class BridgeService:
             self.source.stop()
         except Exception:               # noqa: BLE001 - best-effort teardown
             pass
+        # the Cubase watcher, when it's a SEPARATE standby (not the active
+        # source the line above already stopped), owns an open MIDI port too —
+        # close it here so CoreMIDI doesn't deadlock on it at GC/exit.
+        if self._cubase is not None and self._cubase is not self.source:
+            try:
+                self._cubase.stop()
+            except Exception:           # noqa: BLE001 - best-effort teardown
+                pass
         if self.bridge is not None:
             self.bridge.stop()          # blanks the device (no ghost session)
             self.bridge = None
@@ -284,6 +358,10 @@ class BridgeService:
         self._reset_source_taps()
         self.bridge = LogicBridge(self.client, self.source)
         self.bridge.hash_resolver = self._resolve_plugin_hash
+        # cross-DAW param routing: give the bridge each plugin's device-index ->
+        # identity-hash map (built from the persisted learn refs) so a knob
+        # learned in one DAW drives the same param in another
+        self.bridge.param_identity_resolver = self._param_identity_for_plugin
         # remember the DAW's full param identity for each learn — the serial
         # LEARNED event supplies the landing slot to pair it with
         self.bridge.on_learn_reference = self._stash_learn_ref
@@ -298,6 +376,56 @@ class BridgeService:
     def _resolve_plugin_hash(self, name: str):
         from ..links import hash_from_entry
         return hash_from_entry(self._links.get(name))
+
+    def _param_identity_for_plugin(self, plugin_hash: bytes) -> dict:
+        """{device_param_index -> param name-hash} for a plugin, from the
+        persisted learn refs. The ref keeps the DAW's real param_index +
+        param_name at learn; hashing the name gives the same identity every DAW
+        computes, so the bridge can map a control learned in one DAW onto the
+        same param in another. BOTH control kinds count — an identity is an
+        identity whether a knob or a switch drives it (filtering to knob: left
+        every learned BUTTON un-routable: it fell back to its raw learn-DAW
+        index and toggled whatever the current DAW keeps there). Falls back to
+        the identities stored IN THE DEVICE's map when no refs exist (maps
+        learned before Athens / on another install)."""
+        from ..sysex import codec
+        out: dict = {}
+        for key, ref in self._param_refs.get(plugin_hash.hex(), {}).items():
+            name, idx = ref.get("param_name"), ref.get("param_index")
+            if name and idx is not None:
+                out[int(idx)] = codec.param_hash(name)
+        if not out:
+            out = self._device_map_identity(plugin_hash)
+        return out
+
+    def _device_map_identity(self, plugin_hash: bytes) -> dict:
+        """{param_index -> hash6} read straight from the DEVICE's stored map:
+        each control config carries MH — the 6-byte param hash Athens computed
+        from the param NAME at learn time — so the identity survives even with
+        no local refs. Up to 128 serial round-trips, so the result is cached
+        until the map changes; never cached while serial is detached."""
+        key = plugin_hash.hex()
+        cached = self._device_map_ids.get(key)
+        if cached is not None:
+            return cached
+        out: dict = {}
+        roto = self.roto
+        if roto is None:
+            return out                    # don't cache: serial may attach later
+        try:
+            for i in range(0x40):
+                cfg = roto.read_plugin_knob_config(plugin_hash, i)
+                if cfg is not None and any(cfg.mapped_param_hash):
+                    out[cfg.mapped_param_index] = bytes(cfg.mapped_param_hash)
+                sw = roto.read_plugin_switch_config(plugin_hash, i)
+                if sw is not None and any(sw["mapped_param_hash"]):
+                    out[sw["mapped_param_index"]] = bytes(sw["mapped_param_hash"])
+        except Exception:                 # noqa: BLE001 - identity is best-effort
+            log.debug("device-map identity read failed", exc_info=True)
+        self._device_map_ids[key] = out
+        log.info("device-map identity: %d param identities for %s",
+                 len(out), key)
+        return out
 
     def _save_links(self) -> None:
         if self._links_path is not None:
@@ -368,6 +496,7 @@ class BridgeService:
             self._param_refs.setdefault(h.hex(), {})[f"{kind}:{ci}"] = ref
             self._pending_learn_ref = None
             self._save_param_refs()
+        self._device_map_ids.pop(h.hex(), None)   # map changed: re-read on demand
         self.bus.publish("device_map_changed",
                          {"hash": h.hex(), "kind": kind, "slot": ci})
 
@@ -395,19 +524,39 @@ class BridgeService:
                                        {"hash": h.hex()})
         self._publish_device()
 
+    def _on_device_lost(self) -> None:
+        """The ROTO's serial link dropped (unplug / power). Detach on a fresh
+        thread: we're called from the serial reader as it stops, and _detach
+        closes/revives things it must not run from there. Guarded on having
+        something ATTACHED — not on _connected: the MIDI CONNECTED handshake
+        can still be pending when the link drops (unplug right after attach),
+        and dropping that signal left a zombie attach nothing could revive
+        (bridge non-None blocks the hot-plug poller; roto non-None blocks the
+        connect RPC's serial retry). The reader signals once, and _detach
+        itself is None-safe, so this stays idempotent."""
+        if self.roto is None and self.bridge is None:
+            return                          # already detached (manual disconnect)
+        log.warning("ROTO disconnected (serial link lost) — auto-detaching")
+        import threading
+        threading.Thread(target=self._detach, daemon=True,
+                         name="device-lost").start()
+
     def _detach(self) -> None:
-        if self.bridge is not None:
-            self.bridge.stop()          # stops the source too...
-        self.port = self.client = self.bridge = None
-        if self.roto is not None:
-            self.roto.close()
-            self.roto = None
-        self._set_connected(False)
-        if self._started:
-            # ...but the REAPER endpoint outlives the device: re-tap + revive
-            self._reset_source_taps()
-            self._tap_source_events()
-            self.source.start()
+        # serialised against the hot-plug poller / connect so a detach and an
+        # attach can't interleave into a half-wired state
+        with self._attach_lock:
+            if self.bridge is not None:
+                self.bridge.stop()          # stops the source too...
+            self.port = self.client = self.bridge = None
+            if self.roto is not None:
+                self.roto.close()
+                self.roto = None
+            self._set_connected(False)
+            if self._started:
+                # ...but the REAPER endpoint outlives the device: re-tap + revive
+                self._reset_source_taps()
+                self._tap_source_events()
+                self.source.start()
 
     def _reset_source_taps(self) -> None:
         """Drop the dead bridge's handlers so revived taps start clean. Must
@@ -423,8 +572,48 @@ class BridgeService:
             if hasattr(self.source, name):
                 setattr(self.source, name, None)
 
+    def _wire_script_version(self, src) -> None:
+        """Tell the user when the host is running an OLDER companion script than
+        Athens bundles. The file on disk is refreshed every launch, but Cubase /
+        REAPER run the copy they LOADED — so an update isn't live until the host
+        reloads the script (a Cubase restart / a REAPER re-run). Direct assign,
+        not a chained tap: it's a one-shot detection, and _reset_source_taps
+        leaves it alone. Idempotent — safe to call on every (re)wire."""
+        if src is None:
+            return
+        daw = (getattr(src, "DAW_NAME", "") or "").lower()
+
+        def check(loaded: str) -> None:
+            from athens.daw import script_install
+            expected = script_install.bundled_version(daw)
+            if not expected:
+                return                      # we don't know our own version; skip
+            if loaded == expected:
+                log.info("%s companion script up to date (v%s)",
+                         src.DAW_NAME, loaded)
+                if self._script_stale.pop(daw, None) is not None:
+                    # host reloaded: clear the standing banner
+                    self.bus.publish("script_stale", {"all": self._script_stale})
+                return
+            # loaded is an OLDER version number, OR "" — a pre-version script
+            # that announces nothing, which by default is an older build.
+            shown = "v" + loaded if loaded else "an older, unversioned build"
+            log.warning("%s companion script is STALE: host loaded %s, Athens "
+                        "bundles v%s — reload it", src.DAW_NAME, shown, expected)
+            self._script_stale[daw] = {"daw": src.DAW_NAME, "loaded": loaded,
+                                       "expected": expected}
+            # persistent state (rides get_state for late-connecting UIs) PLUS a
+            # live event for one that's already open
+            self.bus.publish("script_stale", {"all": self._script_stale})
+            self.bus.publish("notice", {
+                "text": "%s is running an old Roto-Control script (%s; latest is "
+                        "v%s) — restart %s to load the update."
+                        % (src.DAW_NAME, shown, expected, src.DAW_NAME)})
+        src.on_script_version = check
+
     # -- event taps (chained AFTER the bridge wired its own handlers) --------
     def _tap_source_events(self) -> None:
+        self._wire_script_version(self.source)
         _chain(self.source, "on_tracks_changed",
                lambda: self.bus.publish("tracks", self._tracks_snapshot()))
         # Per-value mixer changes: REAPER refreshes the whole bank (fires
@@ -479,48 +668,108 @@ class BridgeService:
         self.bus.publish("devices", self._devices_snapshot())
 
     # -- runtime DAW hot-swap (--daw auto) -----------------------------------
+    def _start_cubase_watch(self) -> None:
+        """Keep a Cubase source open from startup so the monitor can confirm
+        Cubase (check_alive on its OWN port) and adopt it — the one safe way,
+        since opening a MIDI port once the device floods deadlocks CoreMIDI. When
+        Cubase is already the active source it IS the watcher; otherwise stand a
+        second one up now, pre-flood. Best-effort: no midi extra / no bridge port
+        just means no Cubase auto-swap."""
+        if self._active_daw == "cubase":
+            self._cubase = self.source
+            return
+        try:
+            from ..daw.detect import make_source
+            watch = make_source("cubase")
+            self._wire_script_version(watch)   # flag a stale Cubase script even
+            #                                    while it's only the standby
+            watch.start()
+            self._cubase = watch
+            log.info("cubase watcher up (auto-swap standby)")
+        except Exception:                # noqa: BLE001 - the watcher is optional
+            log.debug("cubase watcher unavailable", exc_info=True)
+            self._cubase = None
+
     def _daw_monitor(self) -> None:
         """Follow whichever DAW is live, whatever the start order: if the live
         DAW changes (Cubase opened after Athens, REAPER quit, ...) swap the
         source under the running service so the user never relaunches to
         reconnect."""
         import time
-        from ..daw.detect import reaper_feed_live
         while self._started:
             time.sleep(3.0)
             if not self._started:
                 break
             try:
-                # RUNTIME detection opens NO MIDI port: opening one while the
-                # device port floods spins forever in a process-wide CoreMIDI
-                # lock while holding the GIL, freezing the whole app. So use only
-                # free signals — a live Cubase confirmed on its OWN already-open
-                # port, and REAPER's heartbeat file-stat. A Cubase that appears
-                # mid-session is picked up on relaunch (startup probes safely,
-                # before the device port opens).
-                cur = self._active_daw
-                if cur == "cubase" and self._cubase_alive():
-                    continue                        # Cubase still live — stay put
-                if reaper_feed_live() and cur != "reaper":
-                    self._swap_daw("reaper")        # the only runtime-detectable switch
+                self._monitor_tick()
             except Exception:                       # noqa: BLE001 - keep looping
                 log.debug("daw monitor tick failed", exc_info=True)
 
-    def _cubase_alive(self) -> bool:
-        """Confirm the running Cubase source on its already-open port — no new
-        MIDI port (see CubaseSysexSource.check_alive)."""
+    def _monitor_tick(self) -> None:
+        """One follow-the-live-DAW decision. RUNTIME detection opens NO new MIDI
+        port: opening one while the device port floods spins forever in a
+        process-wide CoreMIDI lock while holding the GIL, freezing the whole app.
+        So use only free signals — the Cubase WATCHER (a source opened pre-flood
+        at startup, confirmed on its own port) and REAPER's heartbeat file-stat.
+        Swap only when the CURRENT DAW has gone dead, so a live session is never
+        yanked out from under the user."""
+        from ..daw.detect import reaper_feed_live
+        # The standby Cubase watcher binds roto-bridge ONCE at startup; if that
+        # port wasn't enumerated yet (Athens launched before the IAC bus was up
+        # or before Cubase), it gave up and a later Cubase was never detected —
+        # the device stayed on the empty default DAW. Retry the bind here, but
+        # ONLY while DETACHED (bridge is None): opening a MIDI port while the
+        # device floods is the exact freeze this monitor avoids, so we stay in
+        # the pre-flood window the startup bind used, serialised on the attach
+        # lock (double-checked against a concurrent device attach).
+        if (self._cubase is not None and self.bridge is None
+                and not self._cubase.feed_running()):
+            with self._attach_lock:
+                if self.bridge is None and not self._cubase.feed_running():
+                    self._cubase.start()
+        cur = self._active_daw
+        if cur == "cubase" and self._source_alive():
+            return                                  # live Cubase — stay put
+        if cur == "reaper" and (reaper_feed_live() or self._source_alive()):
+            # live REAPER — stay put. The source's own check covers the
+            # OSC-only setup (Lua feed not loaded, heartbeat file cold): the
+            # file-stat alone would read a live OSC session as dead and yank it.
+            return
+        # the current DAW is dead (or a not-yet-live default): follow a live one.
+        # Cubase via its standby port; REAPER via its heartbeat file.
+        if (self._cubase is not None and cur != "cubase"
+                and self._cubase.check_alive()):
+            self._swap_daw("cubase")
+        elif reaper_feed_live() and cur != "reaper":
+            self._swap_daw("reaper")
+
+    def _source_alive(self) -> bool:
+        """Confirm the ACTIVE source by its own liveness check — free signals
+        only, no new MIDI port (Cubase probes its already-open pair; REAPER
+        reads its feed/OSC timestamps)."""
         check = getattr(self.source, "check_alive", None)
         return bool(check and check())
 
     def _swap_daw(self, daw: str) -> None:
         from ..daw.detect import make_source
-        with self._daw_lock:
+        # BOTH locks: _daw_lock serialises swaps against each other, and
+        # _attach_lock orders the swap against a concurrent device-lost
+        # _detach / hot-plug attach — those mutate the same source/bridge/tap
+        # state, and unserialised they interleave into a half-wired swap
+        # (bridge nulled mid-swap, taps double-chained, the fresh source
+        # stopped). Ordering is always _daw_lock -> _attach_lock; no path
+        # takes them in reverse.
+        with self._daw_lock, self._attach_lock:
             if daw == self._active_daw:
                 return
             log.info("DAW hot-swap: %s -> %s", self._active_daw, daw)
             old = self.source
             self._reset_source_taps()               # silence the old handlers
-            new = make_source(daw)
+            if daw == "cubase" and self._cubase is not None:
+                new = self._cubase                  # ADOPT the running watcher —
+                #                                     its port is already open
+            else:
+                new = make_source(daw)
             self.source = new
             if self.bridge is not None:
                 # rebind the device push path FIRST (direct assignments own the
@@ -528,12 +777,23 @@ class BridgeService:
                 # the device deaf to the new DAW.
                 self.bridge.bind_source(new)
             self._tap_source_events()               # then chain the UI taps on top
-            new.start()
+            if new is not self._cubase:
+                new.start()                         # the watcher is already running
             self._active_daw = daw
-        try:
-            old.stop()
-        except Exception:                           # noqa: BLE001 - best-effort
-            pass
+        # stop the old source — but NEVER the Cubase watcher: it stays open as
+        # the standby so Cubase can be detected again after swapping away.
+        if old is not self._cubase:
+            try:
+                old.stop()
+            except Exception:                       # noqa: BLE001 - best-effort
+                pass
+        # an ADOPTED watcher had no start() to re-announce it — ask Cubase to
+        # replay its full state so the device + UI populate now, not on the next
+        # change.
+        if new is self._cubase:
+            refresh = getattr(new, "refresh_state", None)
+            if callable(refresh):
+                refresh()
         # refresh the UI: new DAW identity + fresh snapshots
         self._daw_alive = True
         self.bus.publish("daw", {"alive": True, "name": new.DAW_NAME})
@@ -652,6 +912,7 @@ class BridgeService:
                 "attached": self.bridge is not None,
                 "mode": self._device_mode,
                 "daw_alive": self._daw_alive,
+                "script_stale": self._script_stale,
                 "selected_track": self.source.selected_track(),
                 "transport": asdict(self.source.transport()),
                 **self._tracks_snapshot(),
@@ -680,27 +941,30 @@ class BridgeService:
         def connect(serial_port: Optional[str] = None,
                     midi_in: Optional[str] = None,
                     midi_out: Optional[str] = None) -> dict:
+            self._user_disconnected = False   # a manual connect re-arms hot-plug
             result = {"midi": False, "serial": False}
-            if self.bridge is None:
-                from ..roto.sysex_client import MidoMidiPort
-                try:
-                    self._attach_midi(MidoMidiPort(midi_in, midi_out))
-                    result["midi"] = True
-                except Exception as exc:  # noqa: BLE001 - surface to the UI
-                    raise RpcError(f"USB-MIDI: {exc}") from exc
-            if self.roto is None:
-                # try the given port first, then every other candidate (the
-                # ROTO has a decoy debug port and renumbers across sockets)
-                cands = ([serial_port] if serial_port else []) \
-                    + [c for c in self._serial_candidates() if c != serial_port]
-                fw = self._attach_best_serial(cands)
-                if fw is not None:
-                    result["fw"] = fw
-                    result["serial"] = True
+            with self._attach_lock:           # vs the hot-plug poller / detach
+                if self.bridge is None:
+                    from ..roto.sysex_client import MidoMidiPort
+                    try:
+                        self._attach_midi(MidoMidiPort(midi_in, midi_out))
+                        result["midi"] = True
+                    except Exception as exc:  # noqa: BLE001 - surface to the UI
+                        raise RpcError(f"USB-MIDI: {exc}") from exc
+                if self.roto is None:
+                    # try the given port first, then every other candidate (the
+                    # ROTO has a decoy debug port and renumbers across sockets)
+                    cands = ([serial_port] if serial_port else []) \
+                        + [c for c in self._serial_candidates() if c != serial_port]
+                    fw = self._attach_best_serial(cands)
+                    if fw is not None:
+                        result["fw"] = fw
+                        result["serial"] = True
             return result
 
         @rpc.method("disconnect")
         def disconnect() -> dict:
+            self._user_disconnected = True    # stay down until a manual connect
             self._detach()
             return {"connected": False}
 
@@ -807,9 +1071,13 @@ class BridgeService:
             from ..protocol import codec as pcodec
             from ..protocol.constants import UNUSED_INDENT, KnobHaptic
 
-            # bounds the flash store can actually hold — clamp here so no
-            # client can write a corrupt config (values are 14-bit, colours
-            # one 7-bit byte, detents 0 or 2-10)
+            # bounds the flash store can actually hold — clamp here so no client
+            # can write a corrupt config. KNOB min/max are 16-bit (wire MN/MX are
+            # 2 bytes; REAPER ranges run to 0xFFxx); switch min/max stay 1 byte.
+            # Colours one 7-bit byte, detents 0 or 2-10.
+            def _b16(v: object) -> int:
+                return max(0, min(65535, int(v)))
+
             def _b14(v: object) -> int:
                 return max(0, min(16383, int(v)))
 
@@ -833,8 +1101,8 @@ class BridgeService:
                     raise RpcError(f"no knob learned at slot {slot}")
                 cfg.name = str(fields.get("name", cfg.name))[:12]
                 cfg.colour = _col(fields.get("colour", cfg.colour))
-                cfg.min_value = _b14(fields.get("min", cfg.min_value))
-                cfg.max_value = _b14(fields.get("max", cfg.max_value))
+                cfg.min_value = _b16(fields.get("min", cfg.min_value))
+                cfg.max_value = _b16(fields.get("max", cfg.max_value))
                 steps = _nsteps(fields.get("steps", cfg.steps))
                 names = [str(n)[:12] for n in
                          fields.get("step_names", cfg.step_names)][:steps]

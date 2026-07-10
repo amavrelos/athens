@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -96,6 +97,25 @@ def _write_if_changed(payload: bytes, dest: Path,
     except OSError as exc:
         log.warning("DAW script sync failed for %s: %s", dest, exc)
         return None
+
+
+# SCRIPT_VERSION = '1'  (JS, single quotes) / SCRIPT_VERSION = "1"  (Lua, double)
+_VERSION_RE = re.compile(rb"""SCRIPT_VERSION\s*=\s*['"]([^'"]*)['"]""")
+
+
+def bundled_version(daw: str) -> Optional[str]:
+    """The version stamped into the bundled companion script for `daw` — the
+    'expected' side of the loaded-vs-latest check. The running script announces
+    the SAME literal (Cubase: in DIAG; REAPER: in live.json), so a mismatch
+    means the host is still running an older copy and needs a reload/restart.
+    None when the bundle or the stamp is missing (check then simply skips)."""
+    subdir, name = ("cubase", CUBASE_SCRIPT) if (daw or "").lower() == "cubase" \
+        else ("reaper", REAPER_SCRIPT)
+    payload = _bundled(subdir, name)
+    if payload is None:
+        return None
+    m = _VERSION_RE.search(payload)
+    return m.group(1).decode("ascii", "replace") if m else None
 
 
 def _steinberg_driver_roots() -> List[Path]:

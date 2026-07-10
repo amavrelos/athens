@@ -29,6 +29,7 @@ from typing import List, Optional
 
 from ..roto.sysex_client import MidiPort
 from . import cubase_contract as wire
+from .echo import EchoGate
 from .source import (
     TRACK_FLAGS, DeviceInfo, PluginParam, SysexDawSource, TrackInfo,
     TransportAction, TransportState,
@@ -38,6 +39,11 @@ log = logging.getLogger(__name__)
 
 BRIDGE_PORT = "roto-bridge"          # macOS exposes the JS's virtual pair as
                                      # "IAC Driver roto-bridge" — match by substring
+# Cubase's MIDI Remote script goes briefly silent when it re-binds/reloads (seen
+# ~8 s on a plugin/track change). Don't blank the device on the first missed
+# keepalive — only declare the session gone after this long of CONTINUOUS
+# silence, so a re-bind hiccup no longer wipes and re-floods the surface.
+_GONE_GRACE_S = 6.0
 
 
 class CubaseSysexSource(SysexDawSource):
@@ -52,11 +58,16 @@ class CubaseSysexSource(SysexDawSource):
         self._transport = TransportState()
         self._daw_tag = ""           # identity the script announced (HELLO)
         self._got_diag = False       # seen the per-block DIAG this session yet?
+        self._script_version = None  # version from the HELLO token ("" = a
+        #                              pre-version script); None until first HELLO
+        #                              so even "" fires once (base on_script_version)
         self._last_rx = 0.0          # monotonic time of the last inbound frame;
         #                              lets the DAW monitor confirm liveness on
         #                              THIS open port (see check_alive)
         self._alive = True           # optimistic: edges fire on transitions only,
         #                              so a live Cubase produces zero extra events
+        self._gone_since = 0.0       # monotonic of the first missed keepalive in
+        #                              the current silence (0 = answering)
         self._stop_evt = threading.Event()
         self._poll: Optional[threading.Thread] = None
         # plugin layer: the selected track's inserts + the focused plugin's
@@ -66,6 +77,18 @@ class CubaseSysexSource(SysexDawSource):
         self._focused_device = 0
         self._param_count = 0
         self._param: dict[int, PluginParam] = {}
+        # learn: LEARN on the device -> a genuine Cubase param move (not our own
+        # write bouncing back) is the "grab" that triggers the device sweep.
+        self._learn_armed = False
+        self._echo = EchoGate()
+        # grab-inference debounce: on plugin focus Cubase DUMPS all 8 bank params
+        # at once — that is NOT a user grab. Collect a short burst and judge it
+        # together: many distinct slots == a dump (ignore); one isolated changed,
+        # non-echo param == the grab.
+        self._grab_lock = threading.Lock()
+        self._grab_seen: set = set()        # every slot seen in the burst
+        self._grab_moved: dict = {}         # slot -> value: changed & non-echo
+        self._grab_timer: Optional[threading.Timer] = None
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -111,6 +134,14 @@ class CubaseSysexSource(SysexDawSource):
         except Exception:      # noqa: BLE001 - best-effort, never crash the timer
             log.debug("Cubase WHO probe failed", exc_info=True)
 
+    def refresh_state(self) -> None:
+        """Make the script re-announce its full state (a plain HELLO triggers
+        the mixer replay + insert list + DIAG). Used when the auto monitor
+        ADOPTS this already-open watcher: unlike a fresh source there is no
+        start() to re-announce it, so the device + UI would otherwise stay empty
+        until the next Cubase change."""
+        self._probe_who()
+
     def _liveness(self) -> None:
         while not self._stop_evt.wait(3.0):
             self.check_alive()          # fires the on_daw_alive edges itself
@@ -143,14 +174,31 @@ class CubaseSysexSource(SysexDawSource):
 
         Fires the on_daw_alive EDGES itself (Cubase quit -> blank the device;
         return -> re-flood), so it works the same from the auto-mode monitor and
-        from our own liveness poller."""
+        from our own liveness poller. The GONE edge is debounced: a brief silence
+        (script re-bind) is ridden out, and only _GONE_GRACE_S of continuous
+        silence blanks the device. Time-based, so the two pollers that call this
+        can't race the debounce. Returns the debounced state — but NEVER True
+        for a watcher that has not heard Cubase at all: the debounce's
+        optimistic initial _alive=True exists so an ESTABLISHED session rides
+        out hiccups, not so the auto-DAW monitor adopts a phantom Cubase at
+        its first tick (~3s, well inside the grace window)."""
         ok = self._check_alive(timeout)
-        if ok != self._alive:
-            self._alive = ok
-            log.info("Cubase %s", "answering again" if ok else
-                     "stopped answering — session gone")
-            self._fire(self.on_daw_alive, ok)
-        return ok
+        now = time.monotonic()
+        if ok:
+            self._gone_since = 0.0
+            if not self._alive:
+                self._alive = True
+                log.info("Cubase answering again")
+                self._fire(self.on_daw_alive, True)
+        else:
+            if self._gone_since == 0.0:
+                self._gone_since = now            # first miss: start the clock
+            elif self._alive and now - self._gone_since >= _GONE_GRACE_S:
+                self._alive = False
+                log.info("Cubase stopped answering — session gone (silent %.0fs)",
+                         now - self._gone_since)
+                self._fire(self.on_daw_alive, False)
+        return self._alive and self._last_rx > 0.0
 
     def _check_alive(self, timeout: float) -> bool:
         if self._port is None:
@@ -231,7 +279,15 @@ class CubaseSysexSource(SysexDawSource):
                 loop=bool(bits & wire.T_LOOP))
             self._fire(self.on_transport_changed)
         elif cmd is wire.Cmd.HELLO:
-            self._daw_tag = bytes(p).decode("ascii", "replace")
+            # token is "cubase <version>" (new) or bare "cubase" (older build).
+            # Keep the identity word as the tag; a missing version -> "" -> the
+            # service treats it as an older build and prompts a reload.
+            parts = bytes(p).decode("ascii", "replace").split(None, 1)
+            self._daw_tag = parts[0] if parts else ""
+            ver = parts[1] if len(parts) > 1 else ""
+            if ver != self._script_version:
+                self._script_version = ver
+                self._fire(self.on_script_version, ver)
             if not self._got_diag:       # a page-activate HELLO carries no DIAG;
                 self._probe_who()         # re-probe so the script ships it once
 
@@ -267,8 +323,16 @@ class CubaseSysexSource(SysexDawSource):
                 bytes(p[2:]).decode("ascii", "replace")
         elif cmd is wire.Cmd.PARAM_VALUE:
             slot = wire.parse_u14(p)
-            self._par(slot).value = wire.norm(wire.parse_u14(p, 2))
+            value = wire.norm(wire.parse_u14(p, 2))
+            old = self._par(slot).value
+            self._par(slot).value = value
             self._fire_param(slot)
+            # LEARN: Cubase has no "user grabbed this param" signal (REAPER does)
+            # — infer it. But a plugin-focus BANK DUMP reports all 8 params at
+            # once and must NOT read as 8 grabs (that swept param 0 every time).
+            # Collect the burst; _commit_learn_grab judges it as a whole.
+            if self._learn_armed and self.on_param_touched:
+                self._note_learn_move(slot, value, abs(old - value) > 1e-4)
         elif cmd is wire.Cmd.PARAM_DISPLAY:
             slot = wire.parse_u14(p)
             self._par(slot).display = bytes(p[2:]).decode("ascii", "replace")
@@ -414,7 +478,55 @@ class CubaseSysexSource(SysexDawSource):
         return [self._param.get(s) or PluginParam(s, "")
                 for s in range(self._param_count)]
 
+    def set_learn_armed(self, armed: bool) -> None:
+        # device LEARN toggles this; while armed, a non-echo param move fires
+        # on_param_touched (see the PARAM_VALUE handler + _commit_learn_grab).
+        self._learn_armed = armed
+        if not armed:                       # drop any half-collected burst
+            with self._grab_lock:
+                if self._grab_timer is not None:
+                    self._grab_timer.cancel()
+                    self._grab_timer = None
+                self._grab_seen.clear()
+                self._grab_moved.clear()
+        log.info("cubase learn armed=%s", armed)
+
+    def _note_learn_move(self, slot: int, value: float, changed: bool) -> None:
+        """Collect PARAM_VALUE activity during learn; a short quiet window later
+        _commit_learn_grab decides. A plugin-focus bank dump lights every slot at
+        once (not a grab); only an isolated changed, non-echo param is one."""
+        with self._grab_lock:
+            self._grab_seen.add(slot)
+            if changed and not self._echo.is_echo("p%d" % slot, value):
+                self._grab_moved[slot] = value
+            if self._grab_timer is not None:
+                self._grab_timer.cancel()
+            self._grab_timer = threading.Timer(0.2, self._commit_learn_grab)
+            self._grab_timer.daemon = True
+            self._grab_timer.start()
+
+    def _commit_learn_grab(self) -> None:
+        with self._grab_lock:
+            seen = len(self._grab_seen)
+            moved = dict(self._grab_moved)
+            self._grab_seen.clear()
+            self._grab_moved.clear()
+            self._grab_timer = None
+        if not (self._learn_armed and self.on_param_touched):
+            return
+        if seen >= 3:
+            log.debug("learn: bank dump (%d params at once) — not a grab", seen)
+            return
+        if len(moved) == 1:
+            slot, value = next(iter(moved.items()))
+            log.info("learn: GRAB param %d = %.3f -> sweep", slot, value)
+            self._fire(self.on_param_touched, self._focused_device, slot)
+        elif len(moved) > 1:
+            log.debug("learn: %d params moved together — ambiguous, no grab",
+                      len(moved))
+
     def set_device_param(self, device_index: int, param_index: int,
                          value: float) -> None:
         self._par(param_index).value = value
+        self._echo.sent("p%d" % param_index, value)   # so its echo isn't a "grab"
         self._send(wire.param_value(param_index, value))

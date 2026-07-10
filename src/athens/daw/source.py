@@ -99,6 +99,11 @@ class SysexDawSource(ABC):
         # The bridge blanks the device on False so it stops showing a ghost
         # session, and re-floods on True.
         self.on_daw_alive: Optional[Callable[[bool], None]] = None
+        # version the LOADED companion script announced (Cubase DIAG / REAPER
+        # live.json). The service compares it to the copy Athens bundles and, on
+        # a mismatch, tells the user the host is running a stale script and must
+        # be reloaded/restarted. Sources without a companion script never fire it.
+        self.on_script_version: Optional[Callable[[str], None]] = None
 
     @abstractmethod
     def start(self) -> None: ...

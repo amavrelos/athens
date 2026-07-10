@@ -123,3 +123,27 @@ def test_parse_async_rejects_truncated_frame():
     except codec.ProtocolError:
         return
     assert False, "truncated async frame must raise"
+
+
+def test_plugin_knob_config_encodes_2byte_param_index():
+    """SET PLUGIN KNOB CONFIG must encode mapped_param_index as 2 bytes: a
+    plugin with >255 params (Acustica SQ3) otherwise overflows the single-byte
+    pack and the whole save aborts. Decode already reads MI as 2 bytes; the
+    encode must match (regression: SQ3 SC2_octave, 2026-07-08)."""
+    cfg = codec.PluginKnobConfig(
+        plugin_hash=b"\x01" * 8, control_index=5, mapped_param_index=300,
+        min_value=63, max_value=65359, name="SC2_octave",
+        steps=4, step_names=["16", "8", "4", "2"])
+
+    p = cfg.payload()                         # must NOT raise ValueError
+    assert p[8] == 5                          # CI
+    assert (p[9] << 8) | p[10] == 300         # MI, 2 bytes big-endian
+
+    # and it round-trips: pad the SET body out to the GET decoder's fixed shape
+    padded = p + b"\x00" * (40 + codec._SN_BLOCK - len(p))
+    back = codec.decode_plugin_knob_config(padded)
+    assert back.mapped_param_index == 300
+    assert back.control_index == 5
+    assert back.max_value == 65359           # 16-bit range survives (not clamped)
+    assert back.name == "SC2_octave"
+    assert back.steps == 4 and back.step_names[:4] == ["16", "8", "4", "2"]

@@ -126,7 +126,7 @@
   var state = {
     tracks: [], selected: 0, firstTrack: 0, transport: {}, connected: false,
     devices: [], selectedDevice: 0, params: [], learnMode: 0, deviceMode: "",
-    daw: "DAW", dawAlive: true,
+    daw: "DAW", dawAlive: true, scriptStale: {},
   };
   var knobs = [], paused = false, actPaused = false;
   // who drives who: "device" = the hardware picks the app view,
@@ -156,7 +156,7 @@
         "devices", "value", "touch", "param", "devparam", "frame", "setups",
         "progress", "learn", "sweep", "device_map_changed", "setup_learned",
         "mode", "setup_selected", "device_plugin_selected", "daw", "notice",
-        "trace"] });
+        "script_stale", "trace"] });
       rpc("get_state").then(applyState);
       rpc("get_plugin_links").then(function (l) { pluginLinks = l; })
         .catch(function () {});
@@ -192,6 +192,7 @@
     $("#chip-connect").hidden = s.connected;
     if (!s.connected) $("#chip-connect").textContent = "connect ▸";
     state.dawAlive = s.daw_alive !== false;
+    state.scriptStale = s.script_stale || {};
     renderReaperLink();
     refreshAll();
     loadPluginView();
@@ -199,17 +200,31 @@
   }
 
   function renderReaperLink() {
-    // Dot + name reflect REAL liveness: alive means REAPER's feed heartbeat is
-    // live, or Cubase's MIDI Remote answered. An empty project (0 tracks) is
-    // still a live connection, so don't gate on tracks>0 (that hid a connected
-    // Cubase whose mixer hadn't pushed yet, showing a misleading "—").
+    // Green/named on REAL liveness, straight from the backend: every source
+    // now owns its own honesty (REAPER: feed heartbeat OR OSC with a gone
+    // grace; Cubase / Pro Tools: answering on their port). Do NOT gate on
+    // tracks>0 — an empty project (0 tracks) is still a live connection, and
+    // that gate mislabeled it "closed" (it also hid a connected Cubase whose
+    // mixer hadn't pushed yet, showing a misleading "—").
     var up = state.dawAlive !== false;
     $("#dot-reaper").classList.toggle("up", up);
     var t = $("#reaper-text");
     if (t) {
-      t.textContent = up ? state.daw
-                         : (state.dawAlive === false ? state.daw + " closed" : "—");
-      t.title = state.dawAlive === false ? (feedHint() || "") : "";
+      // a STALE companion script outranks everything: the host is live but
+      // running an old copy — a PERSISTENT banner (state, not a transient
+      // notice: the check fires ms after launch, before this UI connects)
+      var st = state.scriptStale
+               && state.scriptStale[(state.daw || "").toLowerCase()];
+      if (st) {
+        t.textContent = state.daw + " — old script ("
+          + (st.loaded ? "v" + st.loaded : "unversioned")
+          + "), restart " + state.daw + " to update to v" + st.expected;
+        t.title = "Athens installed v" + st.expected + " on disk, but "
+          + state.daw + " is still running the previously loaded copy.";
+      } else {
+        t.textContent = state.daw ? (up ? state.daw : state.daw + " closed") : "—";
+        t.title = up ? "" : (feedHint() || "");
+      }
     }
   }
 
@@ -325,6 +340,10 @@
       case "learn": onLearn(d); break;
       case "sweep": onSweep(d); break;
       case "notice": setFoot(d.text || ""); break;
+      case "script_stale":
+        state.scriptStale = d.all || {};
+        renderReaperLink();
+        break;
       case "device_map_changed": {
         // the device just stored a learn — refresh whatever shows that map
         delete mapCache[d.hash];

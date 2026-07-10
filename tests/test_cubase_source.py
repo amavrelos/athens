@@ -23,6 +23,41 @@ def test_contract_roundtrips_and_ignores_foreign_frames():
     assert wire.parse(bytes((0xB0, 1, 2))) is None               # a CC, not ours
 
 
+def test_hello_version_fires_on_script_version():
+    """The script rides its SCRIPT_VERSION in the HELLO token ("cubase <v>");
+    the source surfaces it (once per distinct value) so the service can flag a
+    stale, still-loaded script and prompt a Cubase restart."""
+    src, port = make()
+    seen = []
+    src.on_script_version = seen.append
+    port.inject(wire.hello("cubase 42"))
+    assert seen == ["42"]
+    assert src._daw_tag == "cubase"                       # identity still clean
+    port.inject(wire.hello("cubase 42"))                  # same -> no re-fire
+    assert seen == ["42"]
+    port.inject(wire.hello("cubase 43"))                  # changed -> fires
+    assert seen == ["42", "43"]
+
+
+def test_hello_without_version_reports_older_build():
+    """A pre-version script sends bare "cubase" — no version. The source must
+    still fire (with "") so the service treats it as an older build, not silence."""
+    src, port = make()
+    seen = []
+    src.on_script_version = seen.append
+    port.inject(wire.hello("cubase"))
+    assert seen == [""]                                    # "" = older/unversioned
+    assert src._daw_tag == "cubase"
+
+
+def test_bundled_versions_present_and_parseable():
+    """Both companion scripts must carry a parseable SCRIPT_VERSION, or the
+    loaded-vs-latest check silently no-ops (expected == None)."""
+    from athens.daw import script_install
+    assert script_install.bundled_version("cubase")
+    assert script_install.bundled_version("reaper")
+
+
 def test_hello_handshake_records_identity():
     """The script announces "cubase" (HELLO); the source records it so auto-
     detect and the UI know which DAW is on the wire."""
@@ -193,19 +228,30 @@ def test_describe_decodes_contract_frames():
     assert wire.describe(b"\x01\x02")[1] == "not a bridge frame"
 
 
-def test_check_alive_fires_edges_and_uses_ka_tag():
-    """Cubase quitting must blank the device: check_alive fires the
-    on_daw_alive EDGES itself, and its keepalive WHO is tagged "ka" so the
-    script answers lightly (no DIAG / insert-list re-push every poll)."""
+def test_check_alive_fires_edges_and_uses_ka_tag(monkeypatch):
+    """Cubase quitting must blank the device: check_alive fires the on_daw_alive
+    EDGES itself, and its keepalive WHO is tagged "ka" so the script answers
+    lightly. The gone-edge is DEBOUNCED (grace zeroed here) — the first missed
+    keepalive only arms it; a later still-silent poll blanks. A watcher that
+    has NEVER heard Cubase reports False even inside the grace: the optimistic
+    initial state otherwise made the auto-DAW monitor adopt a phantom Cubase
+    at its first tick."""
+    from athens.daw import cubase_source as cs
+    monkeypatch.setattr(cs, "_GONE_GRACE_S", 0.0)
     src, port = make()
     alive = []
     src.on_daw_alive = alive.append
     port.sent.clear()
-    assert src.check_alive(timeout=0.02) is False      # nobody answers
-    assert alive == [False]                            # gone-edge fired once
+
+    assert src.check_alive(timeout=0.02) is False      # never heard Cubase: not
+    assert alive == []                                 #  alive — but not BLANKED
+    #                                                     either (edge debounced)
     kas = [wire.parse(f) for f in port.sent]
     assert any(m and m.cmd is wire.Cmd.HELLO and bytes(m.payload) == b"ka"
-               for m in kas)
+               for m in kas)                           # keepalive tagged "ka"
+
+    assert src.check_alive(timeout=0.02) is False      # still silent -> gone
+    assert alive == [False]
     assert src.check_alive(timeout=0.02) is False      # still gone: NO re-fire
     assert alive == [False]
     port.inject(wire.hello("cubase"))                  # traffic returns
@@ -245,3 +291,104 @@ def test_focus_echo_regate():
     port.inject(wire.focus_device(1))                  # re-pulse of the same slot
     assert fired == [1]                                # gated: no refire
     assert src.device_params(1)                        # params NOT cleared
+
+
+def _flush(src):
+    """Force the debounced grab decision now, skipping the 200 ms quiet timer."""
+    if src._grab_timer is not None:
+        src._grab_timer.cancel()
+    src._commit_learn_grab()
+
+
+def test_learn_move_fires_touch_but_not_echo():
+    """LEARN armed: a genuine, ISOLATED Cubase param move fires on_param_touched
+    (the grab that becomes PLUGIN_PARAM_SWEEP); our own write bouncing back does
+    NOT, and a move while disarmed does NOT."""
+    src, port = make()
+    touched = []
+    src.on_param_touched = lambda fx, p: touched.append((fx, p))
+
+    port.inject(wire.param_value(3, 0.40))          # learn OFF -> no grab
+    _flush(src)
+    assert touched == []
+
+    src.set_learn_armed(True)
+    src.set_device_param(0, 3, 0.70)                # our own write...
+    port.inject(wire.param_value(3, 0.70))          # ...its echo is NOT a grab
+    _flush(src)
+    assert touched == []
+
+    port.inject(wire.param_value(3, 0.55))          # a real, isolated user move
+    _flush(src)
+    assert touched == [(0, 3)]
+
+    src.set_learn_armed(False)
+    port.inject(wire.param_value(3, 0.90))          # disarmed -> no grab
+    _flush(src)
+    assert touched == [(0, 3)]
+
+
+def test_bank_dump_is_not_a_grab():
+    """Plugin focus DUMPS all 8 bank params at once. That must NOT read as eight
+    grabs — the bug that swept param 0 ('Bypass') every time a plugin loaded."""
+    src, port = make()
+    touched = []
+    src.on_param_touched = lambda fx, p: touched.append((fx, p))
+    src.set_learn_armed(True)
+
+    for slot in range(8):                           # the focus dump, all at once
+        port.inject(wire.param_value(slot, 0.5))
+    _flush(src)
+
+    assert touched == []                            # a dump is not a grab
+
+
+def test_ambiguous_multi_move_is_not_a_grab():
+    """Two params changing together in one window is ambiguous — grab neither."""
+    src, port = make()
+    touched = []
+    src.on_param_touched = lambda fx, p: touched.append((fx, p))
+    src.set_learn_armed(True)
+
+    port.inject(wire.param_value(2, 0.3))
+    port.inject(wire.param_value(5, 0.9))
+    _flush(src)
+
+    assert touched == []
+
+
+def test_gone_edge_is_debounced(monkeypatch):
+    """A brief Cubase silence (script re-bind) must NOT blank the device; only
+    sustained silence past the grace does. Time-based so the two pollers that
+    call check_alive can't race it."""
+    from athens.daw import cubase_source as cs
+    src = cs.CubaseSysexSource()                 # no port; probe is stubbed
+    edges = []
+    src.on_daw_alive = lambda alive: edges.append(alive)
+    clock = {"t": 100.0}
+    monkeypatch.setattr(cs.time, "monotonic", lambda: clock["t"])
+    probe = {"ok": True}
+    monkeypatch.setattr(src, "_check_alive", lambda timeout=0.6: probe["ok"])
+
+    src.check_alive()
+    assert edges == []                           # answering -> no edge
+
+    probe["ok"] = False                          # a brief silence begins...
+    src.check_alive()                            # 1st miss -> start the clock
+    clock["t"] += 3.0
+    src.check_alive()
+    assert edges == []                           # 3s < 6s grace -> NOT blanked
+
+    probe["ok"] = True                           # ...Cubase returns in time
+    src.check_alive()
+    assert edges == []                           # ridden out, no blank at all
+
+    probe["ok"] = False                          # now a SUSTAINED silence
+    src.check_alive()                            # 1st miss
+    clock["t"] += 7.0
+    src.check_alive()
+    assert edges == [False]                      # 7s >= 6s grace -> gone
+
+    probe["ok"] = True
+    src.check_alive()
+    assert edges == [False, True]                # recovery -> answering again

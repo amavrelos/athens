@@ -22,6 +22,14 @@ var midiremote_api = require('midiremote_api_v1')
 //=============================================================================
 // contract — mirror of cubase_contract.py
 //=============================================================================
+// BUMP on EVERY change to this file. The running script announces this in its
+// HELLO handshake; Athens compares it to the copy it bundles and, on a
+// mismatch, prompts you to restart Cubase (the host caches the script it
+// loaded, so an on-disk update isn't live until reload). Edit below? Bump this.
+var SCRIPT_VERSION = '8'
+// identity + version in one handshake token: "cubase <version>". A pre-version
+// script sent just "cubase"; Athens reads a missing version as an older build.
+var HELLO_ID = 'cubase ' + SCRIPT_VERSION
 var ID = 0x7D
 // direction byte — a single IAC pair loops back, so tag every frame and skip
 // our own echo (see cubase_contract.py). Cubase acts only on TO_CUBASE.
@@ -35,6 +43,21 @@ var CMD = {
 }
 var FLAG = { MUTE: 0, SOLO: 1, ARM: 2, MONITOR: 3 }
 var NUM_STRIPS = 8          // mix window / plugin param page — the ROTO's knobs
+// DirectAccess (MIDI Remote API 1.2+, Cubase 14+) reads a plugin's WHOLE
+// parameter list on selection (count + every name/value/display), so Athens'
+// identity table does NOT depend on bank bindings. Cap the enumeration so a
+// giant plugin can't flood the bridge; 256 == the Logic dialect's learnable
+// ceiling (MAX_PLUGIN_PARAMETERS).
+var PLUGIN_PARAM_MAX = 256
+// WRITE path: DirectAccess by EXACT param index, via the activation pump (see
+// the write-pump block below). The parameter BANK keeps exactly PAGE_SIZE
+// bindings and is never over-subscribed (32 flat bindings aliased writes
+// mod-8) and never paged for writes (its cell order is the plugin's
+// Remote-Control-Editor layout — an unobservable permutation of the real
+// param list; HW-proven to diverge). The bank's residual jobs: keep the
+// subpage binding structure alive and serve as the degraded write window
+// (cells 0..7) when DirectAccess writes are unavailable.
+var PAGE_SIZE = 8                                // the bank's native width
 
 function u14(v) {
     v = Math.max(0, Math.min(0x3FFF, Math.round(v)))
@@ -109,6 +132,12 @@ var mixKnobs = [], panKnobs = [], muteBtns = [], soloBtns = [],
 // they only "arm" the value.
 function armCC(el, cc) {
     el.mSurfaceValue.mMidiBinding.setInputPort(midiInput).bindToControlChange(0, cc)
+    return el
+}
+// same, on an explicit channel — the plugin param anchors past the 8 visible
+// knobs live on channel 1 so they don't exhaust channel 0's CC map
+function armCCch(el, ch, cc) {
+    el.mSurfaceValue.mMidiBinding.setInputPort(midiInput).bindToControlChange(ch, cc)
     return el
 }
 for (var i = 0; i < NUM_STRIPS; ++i) {
@@ -226,7 +255,28 @@ guard('transport', function () {
 var NUM_INSERTS = 8
 var insertNames = []          // slot -> plugin name, for the ROTO's plugin list
 var insertActs = []           // slot -> hidden button that activates its subpage
+var insertDA = []             // slot -> DirectAccess handle (null on Cubase <=13)
+var dropWarned = {}           // writes we already flagged as un-drivable (DIAG dedupe)
+// --- DirectAccess write pump state (the write path) ---
+var daWriteQueue = {}         // absIdx -> value (latest wins) awaiting a drain
+var daPumpBusy = false        // an activation pulse is in flight to drain it
+var daPumpTs = 0              // when it was pulsed (watchdog re-pulses if lost)
+var daObjCache = []           // slot -> {id, n} params-object (from enumeration)
+var daValuesBad = false       // last enumeration read ALL-ZERO values (degenerate
+//                               DA state) — value flood withheld, retry armed
+var daValuesRetries = 0       // bounded idle-driven retries of the above
+var daValuesLastTry = 0       // clock() of the last retry (backoff pacing)
 var currentSlot = 0           // which plugin subpage is live (restored on activate)
+// clock for the pump watchdog — Cubase's JS engine has Date but no timers; the
+// fallback (paranoia) advances per call so deadlines still eventually pass
+var clock = (typeof Date !== 'undefined' && Date.now)
+    ? function () { return Date.now() }
+    : (function () { var t = 0; return function () { return (t += 50) } })()
+var pluginParamCount = NUM_STRIPS  // focused-plugin param count for eParamCount;
+//                                    DirectAccess keeps it honest, else it stays at
+//                                    the 8 visible knobs (unchanged fallback).
+// makeDirectAccess exists only on API 1.2+ (Cubase 14+); gate every DA call on it.
+var HAS_DIRECT_ACCESS = !!host.makeDirectAccess
 // last-known mixer state per strip so the HELLO handshake can replay it on a
 // mid-session connect (the mixer callbacks are change-only). Mirrors insertNames.
 var trackName = [], trackVol = [], trackPan = [], trackMute = [], trackSolo = []
@@ -245,6 +295,221 @@ function pushMixer(ctx) {
     }
 }
 
+//=============================================================================
+// DirectAccess WRITE PUMP — drive ANY param by its EXACT DA/VST index.
+//
+// Why this shape: the bank's cell order is the plugin's Remote-Control-Editor
+// layout — an arbitrary permutation of the real param list (HW-proven: page-18
+// cells held different params than DA 144-151) that cannot be observed (bank
+// titles never fire). So writes must NOT go through the bank at all.
+// setParameterProcessValue writes by exact index, but needs a LIVE
+// activeMapping — mOnSysex has none, and a cached one is a silent no-op
+// (HW-proven). mOnActivate DOES get a live mapping (our DA enumeration runs in
+// it, HW-proven working) — and pulsing sub.mAction.mActivate re-fires it ON
+// DEMAND, even for the already-active slot (HW-proven: repeated enumerations).
+// So: queue the write, pulse the activation, drain the queue inside
+// mOnActivate with its fresh mapping. Self-clocking: drains re-pulse while
+// writes keep arriving; values coalesce per param (latest wins).
+//=============================================================================
+function writeParam(ctx, absIdx, v) {
+    daWriteQueue[absIdx] = v
+    pumpDAWrites(ctx)
+}
+
+function pumpDAWrites(ctx) {
+    if (daPumpBusy) return                 // a drain is in flight; it re-pumps
+    var act = insertActs[currentSlot]
+    if (!act || !HAS_DIRECT_ACCESS) {      // no pump possible on this host
+        drainFallback(ctx)
+        return
+    }
+    daPumpBusy = true
+    daPumpTs = clock()
+    act.mSurfaceValue.setProcessValue(ctx, 1)
+    act.mSurfaceValue.setProcessValue(ctx, 0)
+}
+
+function pumpWatchdog(ctx) {
+    // an activation pulse can in principle get lost — don't wedge the queue
+    if (daPumpBusy && clock() - daPumpTs > 1500) {
+        daPumpBusy = false
+        pumpDAWrites(ctx)
+    }
+    // all-zero enumeration recovery: re-pulse the activation to re-enumerate.
+    // Ticked by mOnIdle AND every inbound frame, so the first retry lands in
+    // ~200ms (then 1s spacing) — the old keepalive hook only fired after 4s+
+    // of wire silence, which stretched the heal to ~12s on hardware.
+    if (daValuesBad && daValuesRetries < 10 && !daPumpBusy
+            && insertActs[currentSlot]
+            && clock() - daValuesLastTry > (daValuesRetries === 0 ? 200 : 1000)) {
+        daValuesRetries++
+        daValuesLastTry = clock()
+        insertActs[currentSlot].mSurfaceValue.setProcessValue(ctx, 1)
+        insertActs[currentSlot].mSurfaceValue.setProcessValue(ctx, 0)
+    }
+}
+
+function drainDAWrites(ctx, mapping, idx) {
+    var q = daWriteQueue
+    daWriteQueue = {}
+    var keys = [], k
+    for (k in q) keys.push(k)
+    if (keys.length === 0) return
+    var da = insertDA[idx]
+    if (!da || mapping == null || !da.setParameterProcessValue) {
+        daWriteQueueRestoreFallback(ctx, q, keys)
+        return
+    }
+    try {
+        da.activate(mapping)
+        var t = daObjCache[idx]
+        if (!t) t = daObjCache[idx] = daParamsObject(da, mapping)
+        for (var i = 0; i < keys.length; ++i) {
+            var abs = +keys[i]
+            if (abs >= t.n) continue
+            var tag = da.getParameterTagByIndex(mapping, t.id, abs)
+            da.setParameterProcessValue(mapping, t.id, tag, q[keys[i]])
+            // ECHO the applied value back: with the bank callbacks muted this
+            // is Athens' ONLY live value feed — without it its cache freezes at
+            // enumeration time and every plugin re-entry floods STALE values
+            // (knobs anchor to old positions). Also the DAW-confirm echo the
+            // device's haptics expect.
+            send(ctx, eParamValue(abs, q[keys[i]]))
+            var dd = da.getParameterDisplayValue(mapping, t.id, tag)
+            if (dd) send(ctx, eParamDisplay(abs, dd))
+        }
+    } catch (e) {
+        if (!dropWarned.dawrite) {
+            dropWarned.dawrite = true
+            send(ctx, eDiag('DirectAccess write failed (' + e + ') — falling '
+                + 'back to the bank window'))
+        }
+        daWriteQueueRestoreFallback(ctx, q, keys)
+    }
+}
+
+function daWriteQueueRestoreFallback(ctx, q, keys) {
+    // Degraded mode (no DA writes on this host): only the bank's native
+    // window is safely writable — its cell order past that is an unknowable
+    // permutation, and a wrong-param write is the one unforgivable outcome.
+    for (var i = 0; i < keys.length; ++i) {
+        var abs = +keys[i]
+        if (abs < PAGE_SIZE) {
+            paramKnobs[abs].mSurfaceValue.setProcessValue(ctx, q[keys[i]])
+        } else if (!dropWarned[abs]) {
+            dropWarned[abs] = true
+            send(ctx, eDiag('param ' + abs + ' not drivable without '
+                + 'DirectAccess writes'))
+        }
+    }
+}
+
+function drainFallback(ctx) {
+    var q = daWriteQueue
+    daWriteQueue = {}
+    var keys = [], k
+    for (k in q) keys.push(k)
+    if (keys.length) daWriteQueueRestoreFallback(ctx, q, keys)
+}
+
+// DirectAccess enumeration: read the focused plugin's ENTIRE parameter list and
+// stream it to Athens (count + name + value + display), so a track/plugin change
+// populates the identity table with no gesture. `mapping` is the activeMapping
+// handed to mOnChangePluginIdentity / a subpage mOnActivate — DirectAccess needs
+// it to resolve the live object. Fully guarded: any DA hiccup returns false and
+// the reactive bank callbacks (still wired below) carry on exactly as before.
+// DirectAccess object resolution: getBaseObjectID on an INSTRUMENT slot lands
+// on the slot's host wrapper — 3 params ('Freeze', 'Activate Output',
+// 'Extract Sound...'), NOT the synth (HW-confirmed: SQ3 enumerated as those 3).
+// The synth is a CHILD object. Walk the child tree (breadth-first, bounded)
+// and take the object with the MOST parameters — the wrapper never wins.
+// Feature-checked: pre-1.3 builds without child introspection keep the base.
+function daParamsObject(da, mapping) {
+    var base = da.getBaseObjectID(mapping)
+    var bestId = base, bestN = 0
+    try { bestN = da.getNumberOfParameters(mapping, base) } catch (e) { bestN = 0 }
+    if (!da.getNumberOfChildObjects || !da.getChildObjectID)
+        return { id: bestId, n: bestN }
+    var queue = [base], guard = 0
+    while (queue.length > 0 && guard < 64) {
+        guard++
+        var id = queue.shift()
+        var kids = 0
+        try { kids = da.getNumberOfChildObjects(mapping, id) } catch (e2) { kids = 0 }
+        for (var k = 0; k < kids; ++k) {
+            var cid, n
+            try {
+                cid = da.getChildObjectID(mapping, id, k)
+                n = da.getNumberOfParameters(mapping, cid)
+            } catch (e3) { continue }
+            if (n > bestN) { bestId = cid; bestN = n }
+            queue.push(cid)
+        }
+    }
+    return { id: bestId, n: bestN }
+}
+
+function pushDirectParams(idx, mapping, ctx) {
+    // ENTERING a (possibly new) plugin context: the previous plugin must not
+    // leak into this one — reset the advertised count (a failed enumeration
+    // otherwise reports plugin A's count for plugin B) and the drop-warn dedupe.
+    pluginParamCount = NUM_STRIPS
+    dropWarned = {}
+    var da = insertDA[idx]
+    if (!da || mapping == null) return false
+    try {
+        da.activate(mapping)
+        var target = daParamsObject(da, mapping)   // the SYNTH, not the wrapper
+        daObjCache[idx] = target                    // reused by the write pump
+        var objId = target.id
+        var n = target.n
+        if (!(n > 0)) return false
+        if (n > PLUGIN_PARAM_MAX) n = PLUGIN_PARAM_MAX
+        pluginParamCount = n
+        send(ctx, eParamCount(n))
+        var i, tag
+        for (i = 0; i < n; ++i) {
+            tag = da.getParameterTagByIndex(mapping, objId, i)
+            send(ctx, eParamName(i, da.getParameterTitle(mapping, objId, tag, 32)))
+        }
+        // VALUE pass, separate + defended: a degenerate DA state (seen on HW
+        // right after an in-place script reload) returns 0.0 for EVERY param
+        // while titles read fine. Flooding those zeros anchors every mapped
+        // knob to 0 — worse than no data. Detect (a >8-param plugin with not a
+        // single non-zero value is not a real state), retry once, and if still
+        // flat send NO values; daValuesBad arms a keepalive-driven retry.
+        var nonzero = 0
+        for (var attempt = 0; attempt < 2 && nonzero === 0; ++attempt) {
+            nonzero = 0
+            for (i = 0; i < n; ++i) {
+                tag = da.getParameterTagByIndex(mapping, objId, i)
+                if (da.getParameterProcessValue(mapping, objId, tag) !== 0)
+                    nonzero++
+            }
+        }
+        if (n > 8 && nonzero === 0) {
+            daValuesBad = true
+            daValuesLastTry = clock()
+            send(ctx, eDiag('DA values read all-zero (' + n + ' params) — '
+                + 'no value flood; retrying shortly'))
+            return true
+        }
+        daValuesBad = false
+        daValuesRetries = 0
+        for (i = 0; i < n; ++i) {
+            tag = da.getParameterTagByIndex(mapping, objId, i)
+            // getParameterProcessValue is normalised 0..1, matching eParamValue.
+            send(ctx, eParamValue(i, da.getParameterProcessValue(mapping, objId, tag)))
+            var disp = da.getParameterDisplayValue(mapping, objId, tag)
+            if (disp) send(ctx, eParamDisplay(i, disp))
+        }
+        return true
+    } catch (e) {
+        console.log('roto: DirectAccess enumerate failed -> ' + e)
+        return false
+    }
+}
+
 function pushInsertList(ctx) {
     // report through the LAST populated slot, not up to the first gap: slot 0 is
     // the instrument (empty on audio tracks) and inserts can sit past it, so a
@@ -254,22 +519,24 @@ function pushInsertList(ctx) {
     for (var i = 0; i < NUM_INSERTS; i++) if (insertNames[i]) n = i + 1
     send(ctx, eDevCount(n))
     for (var i = 0; i < n; ++i) send(ctx, eDevName(i, insertNames[i] || ''))
-    send(ctx, eParamCount(NUM_STRIPS))
+    send(ctx, eParamCount(pluginParamCount))   // real count once DirectAccess ran
 }
 guard('plugin', function () {
     var chan = host.mTrackSelection.mMixerChannel
     var inserts = chan.mInsertAndStripEffects.mInserts
     var area = page.makeSubPageArea('RotoPlugins')
     // the 8 param-knob surface values are shared across subpages; set callbacks
-    // ONCE — they fire with the ACTIVE subpage's binding (the focused plugin)
-    for (var q = 0; q < NUM_STRIPS; ++q) {
-        (function (slot) {
-            var sv = paramKnobs[slot].mSurfaceValue
-            sv.mOnProcessValueChange = function (ctx, v) { send(ctx, eParamValue(slot, v)) }
-            sv.mOnDisplayValueChange = function (ctx, value, units) {
-                send(ctx, eParamDisplay(slot, units ? (value + ' ' + units) : value)) }
+    // ONCE — they fire for the ACTIVE subpage's binding (the focused plugin).
+    for (var q = 0; q < PAGE_SIZE; ++q) {
+        (function (col) {
+            var sv = paramKnobs[col].mSurfaceValue
+            // NO value/display/name emissions from the bank callbacks: the
+            // bank's cell order is the RCE permutation, so a cell number is
+            // NOT a param index — labeling these would corrupt Athens' table
+            // (DirectAccess enumeration is the one authoritative read).
+            sv.mOnProcessValueChange = function (ctx, v) {}
+            sv.mOnDisplayValueChange = function (ctx, value, units) {}
             sv.mOnTitleChange = function (ctx, o, valTitle) {
-                send(ctx, eParamName(slot, valTitle || o))
                 // objectTitle IS the plugin name, and this re-fires when the
                 // subpage re-binds (mOnActivate) — UNLIKE the change-only identity
                 // callbacks. It's the ONLY signal for an already-loaded plugin on
@@ -285,12 +552,61 @@ guard('plugin', function () {
     function bindSlot(idx, pluginSlot) {
         var sub = area.makeSubPage('P' + idx)
         var bank = pluginSlot.mParameterBankZone
-        for (var q = 0; q < NUM_STRIPS; ++q)
+        if (bank.setWrapAround) bank.setWrapAround(false)
+        // EXACTLY PAGE_SIZE bindings — never over-subscribe the 8-wide bank
+        // (32 bindings aliased writes mod-8: the OSC2_mix -> OSC2_octave bleed).
+        // The bank is NEVER paged for writes (its cell order is the RCE
+        // permutation); it exists to keep the subpage structure + identity
+        // callbacks alive and as the degraded cells-0..7 write window.
+        for (var q = 0; q < PAGE_SIZE; ++q)
             page.makeValueBinding(paramKnobs[q].mSurfaceValue,
                                   bank.makeParameterValue()).setSubPage(sub)
+        // DirectAccess handle for this slot — the authoritative full-param reader
+        // (Cubase 14+). Built once at setup, as Steinberg advise; used only inside
+        // the callbacks below, with their activeMapping.
+        insertDA[idx] = HAS_DIRECT_ACCESS ? (function () {
+            try { return host.makeDirectAccess(pluginSlot) } catch (e) { return null }
+        })() : null
         pluginSlot.mOnChangePluginIdentity = function (ctx, m, name) {
-            insertNames[idx] = name || ''; pushInsertList(ctx)       // change-only
+            insertNames[idx] = name || ''
+            // plugin swapped IN this slot: if it's the one on the knobs, forget
+            // the bank position (the new plugin re-bound it), drop any queued
+            // write (stale intent for the OLD plugin) and re-read the full list.
+            if (idx === currentSlot) {
+                daObjCache[idx] = null     // new plugin: stale DA object handle
+                daWriteQueue = {}          //  and any queued intent is stale too
+                daValuesBad = false        // fresh context: reset the retry arm
+                daValuesRetries = 0
+                pushDirectParams(idx, m, ctx)
+            }
+            pushInsertList(ctx)                                      // change-only
         }
+        // Enumerate the moment this slot becomes the live subpage — device/app
+        // FOCUS_DEVICE, the initial page activate, or a plain track selection that
+        // re-points the slot. This is what ships the full detail set on selection.
+        // try/catch: harmless if a pre-1.2 API lacks subpage mOnActivate (then the
+        // identity callback above still covers plugin loads / selections).
+        try {
+            sub.mOnActivate = function (ctx, m) {
+                // THE WRITE PUMP LANDS HERE: `m` is a LIVE activeMapping, the
+                // one context where DirectAccess calls actually work. Drain
+                // queued writes FIRST (exact-index setParameterProcessValue),
+                // then re-pump if more arrived mid-flight.
+                var pumped = daPumpBusy && currentSlot === idx
+                if (currentSlot !== idx) {
+                    daWriteQueue = {}      // queued intent was for another slot
+                    currentSlot = idx
+                }
+                drainDAWrites(ctx, m, idx)
+                daPumpBusy = false
+                var more = false, mk
+                for (mk in daWriteQueue) { more = true; break }
+                if (more) pumpDAWrites(ctx)
+                // a pump-triggered re-activation must NOT re-flood the full
+                // enumeration (this path fires per drained write burst)
+                if (!pumped) pushDirectParams(idx, m, ctx)
+            }
+        } catch (e) { console.log('roto: subpage mOnActivate unsupported -> ' + e) }
         // The "already-loaded plugin" signal lives ONCE, in the shared param-knob
         // mOnTitleChange above. Don't re-derive it from bank.mOnTitleChange here.
         var act = armCC(surface.makeButton(14 + idx, 1, 1, 1), 80 + idx)
@@ -313,6 +629,7 @@ console.log('roto: Roto-Control script loaded')
 //=============================================================================
 midiInput.mOnSysex = function (activeDevice, message) {
     if (message.length < 5 || message[0] !== 0xF0 || message[1] !== ID) return
+    pumpWatchdog(activeDevice)   // every frame: unwedge a lost pump pulse
     if (message[2] !== DIR.TO_CUBASE) return        // ignore our own state echoes
     var cmd = message[3]
     var p = message.slice(4, message.length - 1)   // payload (drop F7)
@@ -331,7 +648,17 @@ midiInput.mOnSysex = function (activeDevice, message) {
         if (idx < NUM_STRIPS && f === FLAG.SOLO) soloBtns[idx].mSurfaceValue.setProcessValue(activeDevice, on)
     } else if (cmd === CMD.PARAM_VALUE) {
         var slot = fromU14(p, 0)
-        if (slot < NUM_STRIPS) paramKnobs[slot].mSurfaceValue.setProcessValue(activeDevice, fromU14(p, 2) / 0x3FFF)
+        // Route through the paged bank (DirectAccess writes are impossible from
+        // here — no activeMapping in mOnSysex, HW-confirmed dead knobs). Any
+        // index < PLUGIN_PARAM_MAX is drivable; off-page writes queue while the
+        // bank pages over (see writeParam).
+        if (slot < PLUGIN_PARAM_MAX) {
+            writeParam(activeDevice, slot, fromU14(p, 2) / 0x3FFF)
+        } else if (!dropWarned[slot]) {
+            dropWarned[slot] = true
+            send(activeDevice, eDiag('PARAM_VALUE slot ' + slot
+                + ' beyond ' + PLUGIN_PARAM_MAX + ' — not drivable'))
+        }
     } else if (cmd === CMD.TRANSPORT) {
         var bits = p[0]
         playBtn.mSurfaceValue.setProcessValue(activeDevice, (bits & 0x01) ? 1 : 0)
@@ -348,7 +675,7 @@ midiInput.mOnSysex = function (activeDevice, message) {
             insertActs[di].mSurfaceValue.setProcessValue(activeDevice, 0)
         }
     } else if (cmd === CMD.HELLO) {
-        send(activeDevice, eHello('cubase'))
+        send(activeDevice, eHello(HELLO_ID))
         // A TAGGED hello (payload present, e.g. "ka") is Athens' liveness
         // keepalive: the echo above is the whole answer. Only a bare WHO
         // (reconnect) gets the full replay below, so idle sessions aren't re-pushed.
@@ -365,10 +692,14 @@ midiInput.mOnSysex = function (activeDevice, message) {
     }
 }
 
+// idle tick: watchdog for a lost pump pulse, so a wedged queue self-heals even
+// when no further MIDI arrives. Cubase 13+; mOnSysex ticks it too.
+driver.mOnIdle = function (activeDevice) { pumpWatchdog(activeDevice) }
+
 // on activate: announce identity (for Athens' auto-detect) then seed the session
 page.mOnActivate = function (ctx) {
     DIAG.active = 'yes'
-    send(ctx, eHello('cubase'))
+    send(ctx, eHello(HELLO_ID))
     send(ctx, eCount(NUM_STRIPS))
     // Bring the live plugin subpage online immediately: replay cached names, then
     // (re)activate the current slot so its parameter bank binds and reports the

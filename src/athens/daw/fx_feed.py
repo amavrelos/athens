@@ -90,6 +90,11 @@ class ReaperFxFeed:
         # project track count (REAPER's OSC can't distinguish real tracks
         # from bank padding; the ReaScript reports the true count)
         self.on_track_count: Optional[Callable[[int], None]] = None
+        # version the LOADED feed script stamped into live.json — for the
+        # loaded-vs-bundled "reload the ReaScript" check
+        self.on_script_version: Optional[Callable[[str], None]] = None
+        self._script_version: Optional[str] = None   # None until first live.json;
+        #   "" = a pre-version feed (no "version" key) -> still reported as older
         # REAPER liveness edge: True when the heartbeat (re)appears, False
         # when it goes stale. Only fires once the feed has EVER beaten, so a
         # user running OSC-only (no ReaScript) is never wrongly declared gone.
@@ -199,6 +204,11 @@ class ReaperFxFeed:
             count = live.get("tracks")
             if isinstance(count, int):
                 self._fire(self.on_track_count, count)
+            ver = live.get("version")
+            ver = ver if isinstance(ver, str) else ""   # missing key -> older feed
+            if ver != self._script_version:
+                self._script_version = ver
+                self._fire(self.on_script_version, ver)
             if self._data_live(LIVE_FILE):        # live param data: gate stale
                 touched = live.get("touched")
                 if touched and touched.get("seq", 0) != self._touched_seq:

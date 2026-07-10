@@ -24,6 +24,11 @@
   __startup.lua for auto-start, Terminate from the same list.
 --]]
 
+-- BUMP on EVERY change to this file. It rides along in live.json; Athens
+-- compares it to the copy it bundles and prompts a REAPER script reload on a
+-- mismatch (REAPER runs the copy it loaded, not the file on disk). Edit below?
+-- Change this.
+local SCRIPT_VERSION = "1"
 local DIR = reaper.GetResourcePath() .. "/roto-reaper"
 local CHAIN = DIR .. "/chain.json"
 local LIVE = DIR .. "/live.json"
@@ -212,8 +217,9 @@ local function write_live(track)
   live_seq = live_seq + 1
   -- project track count rides along: REAPER's OSC pads its bank with
   -- feedback for non-existent tracks, so OSC alone can't tell project size
-  local parts = { string.format('{"seq":%d,"tracks":%d',
-                                live_seq, reaper.CountTracks(0)) }
+  local parts = { string.format('{"seq":%d,"tracks":%d,"version":%s',
+                                live_seq, reaper.CountTracks(0),
+                                jstr(SCRIPT_VERSION)) }
   if last_touch.fx >= 0 then
     -- the name rides along so params beyond the chain.json inventory cap
     -- (giant plugins) can still be learned with a correct identity hash

@@ -272,8 +272,11 @@ def clear_plugin_control_config(plugin_hash: bytes, control_type: ControlType,
 class PluginKnobConfig:
     """A plugin-mode knob control (spec 4.11 SET PLUGIN KNOB CONFIG).
 
-    Wire payload (base 0x27 bytes + steps*0x0D for SN):
-        PH:8 CI MI MH:6 MA MN:2 MX:2 CN:13 CS HM IP1 IP2 HS SN[HS*13]
+    Wire payload (base 0x28 bytes + steps*0x0D for SN):
+        PH:8 CI MI:2 MH:6 MA MN:2 MX:2 CN:13 CS HM IP1 IP2 HS SN[HS*13]
+    MI is 2 bytes (big-endian): plugins can expose >255 params (Acustica's run
+    into the hundreds), and decode_plugin_knob_config reads it as 2 — the encode
+    MUST match or a >255 param index overflows the single-byte pack.
     """
     plugin_hash: bytes                       # 8 bytes
     control_index: int                       # 0x00 - 0x3F
@@ -296,7 +299,8 @@ class PluginKnobConfig:
             raise ValueError("mapped_param_hash must be 6 bytes")
         return (
             self.plugin_hash
-            + bytes((self.control_index, self.mapped_param_index))
+            + bytes((self.control_index,))
+            + _u16_be(self.mapped_param_index)     # MI: 2 bytes (matches decode)
             + self.mapped_param_hash
             + bytes((1 if self.macro_param else 0,))
             + _u16_be(self.min_value)
