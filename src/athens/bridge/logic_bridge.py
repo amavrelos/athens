@@ -112,6 +112,18 @@ class LogicBridge:
         # called on learn completion with the DAW's full param identity
         # (the device only stores a 12-char display name)
         self.on_learn_reference = None
+        # PARAM-IDENTITY NORMALISATION: the device speaks the param INDEX it was
+        # learned with (a REAPER index, say); a different DAW numbers the same
+        # param differently. Resolve device-index -> identity hash -> the CURRENT
+        # DAW's index by the param's name-hash, so a map learned in one DAW drives
+        # the right param in another. resolver(plugin_hash) -> {device_index: hash6}
+        # (the service builds it from the persisted learn refs). Additive: when
+        # the index already matches (the learn DAW), it is a no-op.
+        self.param_identity_resolver = None
+        self._param_ids: dict = {}          # device_index -> identity hash6
+        self._param_ids_for: Optional[bytes] = None    # plugin the ids are for
+        self._resolved: dict = {}           # device_index -> DAW index (cache)
+        self._reverse: dict = {}            # DAW index -> device index (feedback)
         # fired when the on-surface bank window (_first_track) moves, so the
         # app can follow the device's page arrows (device -> app)
         self.on_bank_changed = None
@@ -231,6 +243,16 @@ class LogicBridge:
             lambda i, l, r: self._submit(lambda: self._on_daw_vu(i, l, r))
         source.on_daw_alive = \
             lambda alive: self._submit(lambda: self._on_daw_alive(alive))
+        # a swapped-in source numbers the same params its own way: force the
+        # cross-DAW index caches to re-resolve against THIS source (the plugin
+        # hash is often unchanged across a swap, so _refresh_param_ids' early
+        # return would otherwise keep the OLD DAW's routing). And re-apply the
+        # device's current learn state — the new source starts disarmed and
+        # would never fire on_param_touched until learn was toggled off/on.
+        self._param_ids_for = None
+        self._resolved.clear()
+        self._reverse.clear()
+        source.set_learn_armed(self._learn_mode == LearnMode.ENABLED)
 
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -401,8 +423,13 @@ class LogicBridge:
 
     def _on_plugin_mode(self, smart: bool) -> None:
         """Device announced its plugin screen (it re-sends this often). Push the
-        strip + PLUGIN_DETAILS every time as Logic does; flood the param values
-        only when the plugin context actually changed."""
+        strip + PLUGIN_DETAILS *and the full value flood* EVERY time, exactly as
+        Logic does. Flood-once-on-entering was a traffic optimisation that broke
+        anchoring on hardware: the device announces the screen ~100ms before it
+        is ready to take value CCs, so the single flood landed in the void and
+        the later announces (where it would stick) got details with NO values —
+        knobs kept their previous screen's positions. Logic re-floods on every
+        announce; so do we."""
         entering = self._plugin_mode is not True or self._smart != smart
         self._plugin_mode, self._smart = True, smart
         self._surface = "plugin"
@@ -411,7 +438,7 @@ class LogicBridge:
             # capture-faithful entry prelude: LEDs + meters zeroed, then
             # colour -> PLUGIN_DETAILS -> full value flood
             self._zero_controls()
-        self._push_plugin_context(force_values=entering)
+        self._push_plugin_context(force_values=True)
 
     # -- device-side overlays --------------------------------------------------
     def _on_track_select_mode(self) -> None:
@@ -525,6 +552,14 @@ class LogicBridge:
         Logic-style SET_TRACK_DETAILS (0x11) frames are accepted but never
         rendered. RGB colours (0x13), volumes and mute LEDs as in the Logic
         capture. SysEx frames are paced ~5ms apart, as config.lua does."""
+        if self._plugin_mode is True:
+            # NEVER touch the surface while the PLUGIN screen is up: the mix
+            # push sends encoder-position CCs (volumes) that CLOBBER the mapped
+            # knobs' anchors — a queued tracks_changed draining after a plugin
+            # entry left the knobs sitting at their mix positions. Logic sends
+            # no mix flow during the plugin screen; the mode-change handlers
+            # re-push the mixer when the mix screen returns.
+            return
         tracks = self.source.tracks()
         log.info("mixer push: %d tracks known, window from %d",
                  len(tracks), self._first_track)
@@ -737,6 +772,7 @@ class LogicBridge:
             d.index, d.name, self._device_hash(d.name), enabled=d.enabled,
             rack_kind=RackKind.NORMAL)
 
+        self._refresh_param_ids(self._device_hash(d.name))
         params = self.source.device_params(dev)
         sig = (dev, d.name, self._smart, len(params))
         if force_values or sig != self._pushed_sig:
@@ -746,11 +782,23 @@ class LogicBridge:
                 self._push_smart_params(params)
             else:
                 self._push_all_param_values(params)
+            self._push_mapped_param_values(dev)   # cross-DAW re-index for learns
             self._watch_params(dev, params)
 
     def _push_all_param_values(self, params: List[PluginParam]) -> None:
         """Populate the plugin view: every param's value CC pair. This is the
         push that makes the device willing to arm learn."""
+        vals = [p for p in params if p.index < MAX_PLUGIN_PARAMETERS]
+        if len(vals) > 8 and all(p.value == 0.0 for p in vals):
+            # a >8-param plugin with EVERY value at 0.0 is not a real state —
+            # it's placeholders (values never received: fresh relaunch) or the
+            # degenerate all-zero DA read. Flooding it would anchor every
+            # mapped knob to 0; keep the current anchors instead — real values
+            # trickle through on_device_param_value the moment they arrive.
+            log.warning("plugin value table is all-zero (%d params) — skipping "
+                        "the anchor flood; knobs keep their anchors until real "
+                        "values arrive", len(vals))
+            return
         n = 0
         for p in params:
             if p.index >= MAX_PLUGIN_PARAMETERS:
@@ -771,6 +819,85 @@ class LogicBridge:
     def _watch_params(self, dev: int, params: List[PluginParam]) -> None:
         self.source.set_watched_params(
             [(dev, p.index) for p in params if p.index < MAX_PLUGIN_PARAMETERS])
+
+    # -- param-identity normalisation (cross-DAW) ------------------------------
+    def _refresh_param_ids(self, plugin_hash: bytes) -> None:
+        """Load {device_index -> identity hash} for the active plugin from the
+        persisted learn refs (via the service). Cached until the plugin changes."""
+        if plugin_hash == self._param_ids_for:
+            return
+        # resolve FIRST, stamp after: stamping before a resolver exception would
+        # leave the previous plugin's map attributed to the new hash — and the
+        # same-hash early-return above would make that permanent.
+        r = self.param_identity_resolver
+        ids = (r(plugin_hash) or {}) if r is not None else {}
+        self._param_ids_for = plugin_hash
+        self._param_ids = ids
+        self._resolved.clear()
+        self._reverse.clear()
+
+    def _daw_param_for_device_index(self, dev: int, device_index: int) -> int:
+        """Translate the index the DEVICE sends to the CURRENT DAW's index for
+        the SAME param, by identity hash. No-op when the param already sits at
+        that index (the learn DAW / an aligned one); falls back to the raw index
+        when there's no identity or the param isn't exposed in this DAW."""
+        if device_index in self._resolved:
+            return self._resolved[device_index]
+        want = self._param_ids.get(device_index)
+        if want is None:                    # no learned identity: raw is final
+            self._resolved[device_index] = device_index
+            return device_index
+        here = self._param(dev, device_index)
+        if here is not None and here.name \
+                and codec.param_hash(here.name) == want:
+            self._resolved[device_index] = device_index
+            return device_index
+        target = next((p.index for p in self.source.device_params(dev)
+                       if p.name and codec.param_hash(p.name) == want), None)
+        if target is None:
+            # the DAW's param names may still be streaming in (OSC drip /
+            # PARAM_NAME frames): do NOT pin the fallback — return it uncached
+            # so the next event retries and snaps to the right param once its
+            # name lands.
+            return device_index
+        self._resolved[device_index] = target
+        return target
+
+    def _device_index_for_daw_param(self, dev: int, daw_index: int) -> int:
+        """The inverse of _daw_param_for_device_index: which DEVICE knob shows
+        this DAW param. DAW-side feedback (value/display) must be echoed at the
+        knob's LEARNED index — a re-indexed knob never tracks DAW-side moves
+        otherwise (and the knob that happens to sit at the DAW's index would be
+        driven with the wrong param's value)."""
+        if not self._param_ids:
+            return daw_index
+        if daw_index in self._reverse:
+            return self._reverse[daw_index]
+        p = self._param(dev, daw_index)
+        if p is None or not p.name:
+            return daw_index                # name not in yet — retry, uncached
+        h = codec.param_hash(p.name)
+        device_index = next((di for di, want in self._param_ids.items()
+                             if want == h), daw_index)
+        self._reverse[daw_index] = device_index
+        return device_index
+
+    def _push_mapped_param_values(self, dev: int) -> None:
+        """Cross-DAW display: for each LEARNED knob whose param this DAW exposes
+        at a DIFFERENT index, push that value/display at the DEVICE's index so the
+        knob shows the right position + endstops. No-op when aligned or absent."""
+        if not self._param_ids:
+            return
+        by_hash: dict = {}
+        for p in self.source.device_params(dev):
+            by_hash.setdefault(codec.param_hash(p.name), p)
+        for device_index, want in self._param_ids.items():
+            p = by_hash.get(want)
+            if (p is not None and p.index != device_index
+                    and device_index < MAX_PLUGIN_PARAMETERS):
+                self.client.send_param_value_cc(device_index, p.value)
+                if p.display:
+                    self.client.send_param_display(device_index, p.display)
 
     # -- learn / sweep -----------------------------------------------------------
     def _on_learn_mode(self, mode: int) -> None:
@@ -987,13 +1114,23 @@ class LogicBridge:
         if self._sweep is not None and param == self._sweep.param:
             return          # our own sweep traffic
         dev = self.source.selected_device()
+        # NORMALISE: the device sends the param index it LEARNED (a REAPER index,
+        # say); route it to THIS DAW's index for the same param by identity hash.
+        target = self._daw_param_for_device_index(dev, param)
+        if log.isEnabledFor(logging.DEBUG):
+            p = self._param(dev, target)
+            log.debug("device param %d -> DAW %r (index %d)%s", param,
+                      p.name if p else None, target,
+                      "" if p else " (NOT in the DAW's exposed params)")
+        # calibration stays keyed by the DEVICE knob (its learned curve/steps);
+        # the resolved value is DAW-agnostic 0-1, so it applies to the target.
         value = self._snap(dev, param, value)
-        self.source.set_device_param(dev, param, value)
+        self.source.set_device_param(dev, target, value)
         now = time.monotonic()
         if now - self._echo_last.get(param, 0.0) >= 0.025:
             self._echo_last[param] = now
-            self.client.send_param_value_cc(param, value)
-            p = self._param(dev, param)
+            self.client.send_param_value_cc(param, value)   # echo at DEVICE index
+            p = self._param(dev, target)                     # display from target
             if p is not None and p.display:
                 self.client.send_param_display(param, p.display)
 
@@ -1012,12 +1149,17 @@ class LogicBridge:
         only feeds values back while learn is off; sweeps drive themselves)."""
         if self._learn_mode != LearnMode.DISABLED or self._sweep is not None:
             return
-        if fx != self.source.selected_device() or param >= MAX_PLUGIN_PARAMETERS:
+        if fx != self.source.selected_device():
             return
-        self.client.send_param_value_cc(param, value)
-        if display and self._display_cache.get(param) != display:
-            self._display_cache[param] = display
-            self.client.send_param_display(param, display)
+        # echo at the DEVICE's learned index: cross-DAW, this DAW may expose
+        # the param at a different index than the knob was learned with
+        slot = self._device_index_for_daw_param(fx, param)
+        if slot >= MAX_PLUGIN_PARAMETERS:
+            return
+        self.client.send_param_value_cc(slot, value)
+        if display and self._display_cache.get(slot) != display:
+            self._display_cache[slot] = display
+            self.client.send_param_display(slot, display)
 
     # -- mixer ---------------------------------------------------------------------
     def _on_select_track(self, index: int) -> None:

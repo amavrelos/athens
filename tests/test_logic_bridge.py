@@ -396,7 +396,7 @@ def test_connected_acks_global_and_pushes_mixer():
     assert not sysex_sent(port, Group.MIXER, Mixer.DAW_SELECT_FOCUS_TRACK)
 
 
-def test_plugin_mode_populates_once():
+def test_plugin_mode_refloods_on_every_announce():
     port, _, source, _ = make()
     inject(port, Group.PLUGIN, Plugin.SET_PLUGIN_MODE, b"\x00")
     details = sysex_sent(port, Group.PLUGIN, Plugin.PLUGIN_DETAILS)
@@ -406,12 +406,15 @@ def test_plugin_mode_populates_once():
     # all 4 mock params pushed as value CC pairs on channel 0xBE
     ccs = [f for f in port.sent if f[0] == 0xBE]
     assert len(ccs) == 8
-    # repeated announcements while already in plugin mode don't re-flood...
+    # repeated announcements RE-FLOOD, exactly as Logic does: the device
+    # announces the screen ~100ms before it can take value CCs, so the flood
+    # gated to entering-only landed in the void and knobs kept the previous
+    # screen's positions (HW-confirmed on REAPER and Cubase)
     port.sent.clear()
     inject(port, Group.PLUGIN, Plugin.SET_PLUGIN_MODE, b"\x00")
     assert sysex_sent(port, Group.PLUGIN, Plugin.PLUGIN_DETAILS)
-    assert not [f for f in port.sent if f[0] == 0xBE]
-    # ...but RE-ENTERING plugin mode from mix MUST re-flood: the device drops
+    assert len([f for f in port.sent if f[0] == 0xBE]) == 8
+    # RE-ENTERING plugin mode from mix also re-floods: the device drops
     # its param values on screen changes; without the flood mapped knobs have
     # no position anchor (capture-diffed vs Logic — the free-spin root cause)
     inject(port, Group.MIXER, Mixer.SET_MIXER_ALL_MODE, bytes((0, 0, 0, 0)))
@@ -811,3 +814,136 @@ def test_on_device_param_applies_calibration():
     bridge._calibration[(0, 0)] = [0.0, 0.4, 0.42, 0.95]     # device 0 selected
     bridge._on_device_param(0, 0.50)                         # device sends 0.50
     assert source.device_params(0)[0].value == pytest.approx(0.42)
+
+
+# -- param-identity normalisation (cross-DAW routing) -------------------------
+def _plugin_source(monkeypatch, params):
+    """A single-plugin source exposing `params`, recording param writes."""
+    port, client, source, bridge = make()
+    monkeypatch.setattr(source, "device_params", lambda dev: params)
+    monkeypatch.setattr(source, "selected_device", lambda: 0)
+    writes = []
+    monkeypatch.setattr(source, "set_device_param",
+                        lambda dev, p, v: writes.append((dev, p, v)))
+    return bridge, writes
+
+
+def test_identity_normalises_cross_daw_index(monkeypatch):
+    """Knob learned in REAPER (index 11 = OSC2_mix) drives the SAME param where
+    this DAW numbers it 20 — resolved by the param name-hash, not the index."""
+    params = [PluginParam(0, "Mastertune", 0.0),
+              PluginParam(1, "OSC2_octave", 0.0),
+              PluginParam(20, "OSC2_mix", 0.0)]
+    bridge, writes = _plugin_source(monkeypatch, params)
+    bridge._param_ids = {11: codec.param_hash("OSC2_mix")}   # learned at index 11
+
+    bridge._on_device_param(11, 0.5)
+
+    assert writes and writes[-1][1] == 20        # routed to 20, not 11
+
+
+def test_identity_is_a_noop_when_index_aligns(monkeypatch):
+    """The learn DAW (or an index-aligned one) must NOT re-route — the param
+    already at the device index carries the right identity."""
+    params = [PluginParam(11, "OSC2_mix", 0.0)]
+    bridge, writes = _plugin_source(monkeypatch, params)
+    bridge._param_ids = {11: codec.param_hash("OSC2_mix")}
+
+    bridge._on_device_param(11, 0.5)
+
+    assert writes[-1][1] == 11                    # unchanged (fast path)
+
+
+def test_identity_falls_back_to_raw_index(monkeypatch):
+    """No learned identity (or the param isn't exposed here) -> raw index, i.e.
+    exactly the old behaviour. Nothing regresses for unlearned knobs."""
+    params = [PluginParam(7, "Cutoff", 0.0)]
+    bridge, writes = _plugin_source(monkeypatch, params)
+    bridge._param_ids = {}                        # nothing learned
+
+    bridge._on_device_param(7, 0.5)
+
+    assert writes[-1][1] == 7
+
+
+def test_all_zero_value_table_is_never_flooded():
+    """A >8-param table with EVERY value 0.0 is placeholders or a degenerate
+    DA read — flooding it anchors every mapped knob to 0 (the knobs-at-zero /
+    knobs-stuck bug). Skip it; one real value makes the flood flow again."""
+    port, client, source, bridge = make()
+    zeros = [PluginParam(i, f"P{i}", 0.0) for i in range(20)]
+    port.sent.clear()
+    bridge._push_all_param_values(zeros)
+    assert port.sent == []                       # nothing anchored to zero
+
+    zeros[3] = PluginParam(3, "P3", 0.4)         # one genuine value -> real table
+    bridge._push_all_param_values(zeros)
+    assert port.sent != []
+
+
+def test_mixer_push_never_touches_the_plugin_screen():
+    """A tracks_changed draining while the PLUGIN screen is up must not send
+    encoder-position CCs — they clobber the mapped knobs' anchors (the
+    knobs-stuck-at-their-mix-positions bug on plugin entry)."""
+    port, client, source, bridge = make()
+    bridge._on_plugin_mode(False)          # device is on the plugin screen
+    port.sent.clear()
+
+    bridge._push_mixer()                   # e.g. a queued tracks_changed
+
+    assert port.sent == []                 # NOTHING sent while plugin is up
+
+    bridge._on_mixer_all_mode(0, 0, 0)     # back to mix: pushes flow again
+    assert port.sent != []
+
+
+def test_service_builds_identity_map_from_refs():
+    """The service turns persisted learn refs into {device_index -> name-hash}
+    for BOTH control kinds — filtering to knob: left every learned BUTTON
+    un-routable (it fell back to its raw learn-DAW index and toggled whatever
+    the current DAW keeps there: the OSC_key_sync-toggles-the-sub bug)."""
+    from athens.api.service import BridgeService
+    from athens.daw.source import MockSysexSource
+    svc = BridgeService(source=MockSysexSource())
+    svc._param_refs = {"aabbcc": {
+        "knob:0": {"param_index": 11, "param_name": "OSC2_mix"},
+        "knob:1": {"param_index": 3, "param_name": "OSC2_octave"},
+        "switch:2": {"param_index": 149, "param_name": "OSC1_on/off"},
+    }}
+    m = svc._param_identity_for_plugin(bytes.fromhex("aabbcc"))
+    assert m == {11: codec.param_hash("OSC2_mix"),
+                 3: codec.param_hash("OSC2_octave"),
+                 149: codec.param_hash("OSC1_on/off")}
+
+
+def test_service_identity_falls_back_to_device_map():
+    """No persisted refs -> read the identities straight from the DEVICE's
+    stored map (MH = the hash6 sent at learn time). Cached; empty-refs plugins
+    learned before Athens still route cross-DAW."""
+    from athens.api.service import BridgeService
+    from athens.daw.source import MockSysexSource
+
+    class _Cfg:                                     # knob config stub
+        def __init__(self, mi, mh):
+            self.mapped_param_index = mi
+            self.mapped_param_hash = mh
+
+    class _Roto:
+        def read_plugin_knob_config(self, h, i):
+            return _Cfg(146, b"\x01\x02\x03\x04\x05\x06") if i == 0 else None
+
+        def read_plugin_switch_config(self, h, i):
+            return ({"mapped_param_index": 149,
+                     "mapped_param_hash": b"\x0a\x0b\x0c\x0d\x0e\x0f"}
+                    if i == 1 else None)
+
+    svc = BridgeService(source=MockSysexSource())
+    svc._param_refs = {}
+    svc.roto = _Roto()
+    m = svc._param_identity_for_plugin(bytes.fromhex("16485d67605b5e5a"))
+    assert m == {146: b"\x01\x02\x03\x04\x05\x06",
+                 149: b"\x0a\x0b\x0c\x0d\x0e\x0f"}
+    # cached: a second call must not re-read serial
+    svc.roto = None
+    assert svc._param_identity_for_plugin(
+        bytes.fromhex("16485d67605b5e5a")) == m
