@@ -118,6 +118,12 @@ def _serve_web(directory: Path, want_port: int):
         # a port another process is actively listening on, so there we'd rather
         # lose the fixed port to the fallback than take someone else's.
         allow_reuse_address = not sys.platform.startswith("win")
+        # ThreadingHTTPServer leaves block_on_close True even though its request
+        # threads are daemons, so server_close() joins EVERY one of them with no
+        # timeout. Chromium speculatively opens sockets it may never send a
+        # request on, and that handler sits in readline() forever — the join
+        # would wedge teardown. They're daemons; let the process reap them.
+        block_on_close = False
 
         def server_bind(self):
             # HTTPServer.server_bind() fills in server_name with socket.getfqdn()
@@ -129,6 +135,7 @@ def _serve_web(directory: Path, want_port: int):
             self.server_name, self.server_port = self.server_address[:2]
 
     class _Handler(SimpleHTTPRequestHandler):
+        timeout = 10          # a silent pre-connect can't pin a handler thread
         # Windows resolves MIME types through the registry, where .css and .js
         # are often registered as text/plain — which Chromium refuses to apply
         # or import. An explicit map is consulted before mimetypes, so the types
@@ -264,19 +271,28 @@ def _enable_ctrl_c(stop) -> None:
 class _LocateApi:
     """Exposed to the page as pywebview.api.* — the native folder picker behind
     the 'Locate' buttons (a web page on the WS API can't open a native dialog).
-    Runs in-process, so it drives the service directly."""
+    Runs in-process, so it drives the service directly.
+
+    EVERY public attribute here must be CALLABLE. pywebview builds the JS proxy
+    by walking dir() of this object and recursing into any public non-callable
+    attribute (util.inject_pywebview.get_functions), skipping only _-prefixed
+    names. Its cycle guard keys on id(), which pythonnet defeats by minting a
+    fresh wrapper per .NET property access — so handing it the pywebview Window
+    sent the walk down window.native.AccessibilityObject.Bounds.Empty.Empty...
+    forever, marshalling COM off the UI thread until Windows called the app
+    unresponsive. Hence _window, not window."""
 
     def __init__(self, service):
         self._service = service
-        self.window = None            # set right after the window is created
+        self._window = None           # set right after the window is created
 
     def pick_daw_folder(self, daw):
         """Open a native folder picker; on choose, point that DAW's script
         install at it and drop the script in. Returns status + notes."""
-        if self.window is None:
+        if self._window is None:
             return {"error": "no window"}
         import webview
-        picked = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        picked = self._window.create_file_dialog(webview.FOLDER_DIALOG)
         if not picked:
             return {"cancelled": True}
         folder = picked[0] if isinstance(picked, (list, tuple)) else picked
@@ -367,7 +383,7 @@ def launch(host: str = "127.0.0.1", port: int = 8765,
         min_size=MIN_WINDOW,
         js_api=locate_api,
     )
-    locate_api.window = window
+    locate_api._window = window   # _-prefixed: pywebview must not walk into it
     # primary teardown: fires on the GUI thread when the user closes the
     # window, even when webview.start() never returns to the finally
     for _evt in ("closing", "closed"):

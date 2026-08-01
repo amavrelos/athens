@@ -92,6 +92,24 @@ def test_window_urls_survive_system_uri_round_trip():
     assert "%3F" not in fb and "%23" not in fb, f"{fb} {runtime}"
 
 
+def test_locate_api_exposes_only_callables():
+    """pywebview builds the JS proxy by walking dir() of the js_api object and
+    RECURSING into every public non-callable attribute, skipping only the
+    _-prefixed ones (util.inject_pywebview.get_functions). Its cycle guard keys
+    on id(), which pythonnet defeats — a fresh wrapper per .NET property access
+    — so 0.1.2 froze on Windows walking window.native.AccessibilityObject
+    .Bounds.Empty.Empty... forever, marshalling COM off the UI thread. Any
+    public non-callable here is that bug again."""
+    api = shell._LocateApi(service=object())
+    api._window = object()                 # as launch() sets it
+    exposed = [n for n in dir(api) if not n.startswith("_")]
+    assert exposed, "the Locate buttons need their methods exposed"
+    for name in exposed:
+        assert callable(getattr(api, name)), (
+            f"_LocateApi.{name} is public and not callable — pywebview will "
+            f"recurse into it when building window.pywebview.api")
+
+
 def _get(port, path):
     return urllib.request.urlopen(f"http://127.0.0.1:{port}{path}")
 
