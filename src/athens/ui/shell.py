@@ -93,6 +93,80 @@ DEFAULT_WINDOW = (1200, 760)
 MIN_WINDOW = (960, 640)
 
 
+def _serve_web(directory: Path, want_port: int):
+    """Serve the UI over loopback HTTP and return (port, shutdown).
+
+    The page used to load straight off disk, but a file:// URL cannot carry the
+    query string we pass the page (the WS address, the view, the cache-buster).
+    pywebview navigates Windows through .NET — `webview.Source = Uri(url)` in
+    edgechromium.py — and System.Uri parses file: URIs under legacy V2 quirks
+    when the host declares no target framework, which a pythonnet-hosted CLR
+    doesn't: the file syntax then has no MayHaveQuery, so '?' is swallowed into
+    the PATH and escaped. Chromium is handed a file whose name ends '...html%3F
+    b=...' and answers ERR_FILE_NOT_FOUND. A loopback server sidesteps that with
+    ONE code path on every platform, and gives the page a real origin (file://
+    documents are a unique origin, so fetching our own assets is CORS-blocked
+    there). Returns (None, None) if it can't bind, so a failure here degrades to
+    a file:// URL instead of no window at all."""
+    import functools
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Server(ThreadingHTTPServer):
+        # SO_REUSEADDR lets a relaunch reclaim the port while the last window's
+        # connections sit in TIME_WAIT — but on Windows it also lets a bind STEAL
+        # a port another process is actively listening on, so there we'd rather
+        # lose the fixed port to the fallback than take someone else's.
+        allow_reuse_address = not sys.platform.startswith("win")
+
+    class _Handler(SimpleHTTPRequestHandler):
+        # Windows resolves MIME types through the registry, where .css and .js
+        # are often registered as text/plain — which Chromium refuses to apply
+        # or import. An explicit map is consulted before mimetypes, so the types
+        # can't come out machine-local.
+        extensions_map = {
+            **SimpleHTTPRequestHandler.extensions_map,
+            ".html": "text/html; charset=utf-8",
+            ".js": "text/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".json": "application/json",
+            ".png": "image/png",
+            ".svg": "image/svg+xml",
+        }
+
+        def end_headers(self):
+            # the window relaunches far more often than the assets change, and a
+            # stale shell is indistinguishable from a broken build
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
+        def log_message(self, fmt, *args):     # into the app log, not stderr
+            log.debug("web: " + fmt, *args)
+
+    handler = functools.partial(_Handler, directory=str(directory))
+    httpd = None
+    # A STABLE port matters: the page's origin is its localStorage key, so an
+    # ephemeral one would silently reset the theme and follow-mode toggles on
+    # every launch. Port 0 stays as the last resort — losing those two prefs for
+    # a session beats not opening a window.
+    for candidate in (want_port, 0):
+        try:
+            httpd = _Server(("127.0.0.1", candidate), handler)
+            break
+        except OSError as exc:
+            log.warning("web server could not bind 127.0.0.1:%d (%s)",
+                        candidate, exc)
+    if httpd is None:
+        return None, None
+
+    def shutdown() -> None:
+        httpd.shutdown()          # idempotent; called from atexit AND `finally`
+        httpd.server_close()
+
+    threading.Thread(target=httpd.serve_forever, daemon=True,
+                     name="athens-web").start()
+    return httpd.server_port, shutdown
+
+
 def _library_path():
     """Persistent library location — the library is the archive (firmware
     updates can wipe the device's stored maps)."""
@@ -158,8 +232,8 @@ def _enable_ctrl_c(stop) -> None:
 
 class _LocateApi:
     """Exposed to the page as pywebview.api.* — the native folder picker behind
-    the 'Locate' buttons (a file:// page on the WS API can't open a native
-    dialog). Runs in-process, so it drives the service directly."""
+    the 'Locate' buttons (a web page on the WS API can't open a native dialog).
+    Runs in-process, so it drives the service directly."""
 
     def __init__(self, service):
         self._service = service
@@ -244,13 +318,26 @@ def launch(host: str = "127.0.0.1", port: int = 8765,
     _observers = _install_terminate_observer(service.stop)
 
     index = WEB_DIR / "index.html"
-    # per-launch cache-buster: WKWebView caches file:// documents by URL, so a
-    # same-URL relaunch can serve a STALE page. A unique query forces a fresh load.
+    if not index.exists():
+        # a packaging miss (datas not collected) would otherwise surface as a
+        # bare "file not found" page with nothing pointing at the cause
+        log.critical("UI assets are missing: no %s (web dir %s)", index, WEB_DIR)
+    # per-launch cache-buster — belt-and-braces behind the no-store header
     import time
-    bust = int(time.time())
-    url = index.as_uri() + f"?b={bust}&ws=ws://{host}:{port}"
+    params = f"b={int(time.time())}&ws=ws://{host}:{port}"
     if view:
-        url += f"&view={view}"
+        params += f"&view={view}"
+    # the UI port trails the API port so both shift together with --port and two
+    # Athens instances keep distinct, stable origins
+    web_port, web_shutdown = _serve_web(WEB_DIR, port + 1)
+    # the fallback hands the params over as a FRAGMENT, not a query: '?' is what
+    # file:// can't carry through .NET's Uri (see _serve_web), '#' survives it.
+    # app.js reads either.
+    url = (f"http://127.0.0.1:{web_port}/index.html?{params}" if web_port
+           else index.as_uri() + f"#{params}")
+    if web_shutdown:
+        atexit.register(web_shutdown)
+    log.info("UI assets: %s -> %s", WEB_DIR, url)
     locate_api = _LocateApi(service)
     window = webview.create_window(
         APP_NAME, url,
@@ -274,4 +361,6 @@ def launch(host: str = "127.0.0.1", port: int = 8765,
         webview.start()          # blocks until the window closes
     finally:
         service.stop()
+        if web_shutdown:
+            web_shutdown()
     return 0

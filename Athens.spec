@@ -73,4 +73,15 @@ if _MAC:
         name="Athens.app",
         icon=_p("packaging/Athens.icns"),
         bundle_identifier="com.nodalpoint.athens",
+        info_plist={
+            # the UI is loaded from a loopback HTTP server (see ui/shell.py);
+            # spell out the ATS carve-out rather than rely on the implicit one
+            "NSAppTransportSecurity": {
+                "NSAllowsLocalNetworking": True,
+                "NSExceptionDomains": {
+                    "127.0.0.1": {"NSExceptionAllowsInsecureHTTPLoads": True},
+                    "localhost": {"NSExceptionAllowsInsecureHTTPLoads": True},
+                },
+            },
+        },
     )

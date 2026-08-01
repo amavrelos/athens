@@ -2,7 +2,9 @@
 (function () {
   "use strict";
 
-  var QS = new URLSearchParams(location.search);
+  // normally a query; a fragment when the shell fell back to a file:// URL,
+  // which can't carry '?' through the Windows webview (see ui/shell.py)
+  var QS = new URLSearchParams(location.search || location.hash.slice(1));
   var WS_URL = QS.get("ws") || "ws://127.0.0.1:8765";
   // launched with `ui --view diag` → expose internals like plugin hashes
   var DIAG_MODE = QS.get("view") === "diag";
