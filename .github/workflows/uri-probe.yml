@@ -1,0 +1,22 @@
+# One-shot System.Uri characterization (manual trigger only) — measures, on
+# the runtime pywebview actually loads, the mechanism diagnosed behind 0.1.1's
+# ERR_FILE_NOT_FOUND: legacy V2 Uri quirks swallowing '?' on file:// URLs.
+# The job FAILS only when the environment is not representative (wrong
+# runtime / declared TFM / PYTHONNET_RUNTIME set); the measurement itself is
+# printed and mirrored into the job summary for a human to read, never
+# asserted — the permanent invariant test lives in tests/test_shell.py.
+name: uri-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # [ui] pulls pywebview -> pythonnet, the same resolution a user install gets
+      - run: python -m pip install -e ".[ui]"
+      - run: python scripts/uri_probe.py

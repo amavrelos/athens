@@ -6,6 +6,8 @@ import types
 import urllib.error
 import urllib.request
 
+import pytest
+
 from athens.ui import shell
 
 
@@ -42,6 +44,52 @@ def test_launch_setup_path_has_no_stray_names(monkeypatch, tmp_path):
     assert opened == [opened[0]] and opened[0].startswith("http://127.0.0.1:8800/")
     assert "/index.html?b=" in opened[0]
     assert "ws=ws://127.0.0.1:8799" in opened[0]
+
+
+def test_window_url_is_http_query_or_file_fragment():
+    # the production URL builder, byte-exact: http carries the params as a
+    # query; the file:// fallback must carry them as a fragment ONLY — a '?'
+    # there is the 0.1.1 ERR_FILE_NOT_FOUND (System.Uri swallows it, shell.py)
+    u = shell._window_url(8766, "127.0.0.1", 8765, view="diag", bust=42)
+    assert u == ("http://127.0.0.1:8766/index.html"
+                 "?b=42&ws=ws://127.0.0.1:8765&view=diag")
+    f = shell._window_url(None, "127.0.0.1", 8765, bust=42)
+    assert f == (shell.WEB_DIR / "index.html").as_uri() + \
+        "#b=42&ws=ws://127.0.0.1:8765"
+    assert "?" not in f
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"),
+                    reason="System.Uri is the Windows navigation path only")
+def test_window_urls_survive_system_uri_round_trip():
+    """pywebview navigates Windows through .NET (`webview.Source = Uri(url)`,
+    edgechromium.py) — and a pythonnet-hosted CLR declares no target framework,
+    which puts System.Uri in legacy V2 quirks: the file: syntax loses
+    MayHaveQuery, '?' is swallowed into the path and escaped to %3F, and
+    Chromium answers ERR_FILE_NOT_FOUND (the 0.1.1 bug). This asserts the
+    INVARIANT we rely on — the URLs launch() actually builds survive the round
+    trip — never the buggy behaviour, so it stays green if Microsoft changes
+    .NET and goes red only if we regress into a URL this runtime rewrites."""
+    pytest.importorskip("clr")             # pythonnet — pulled in by [ui] here
+    from System import AppDomain, Uri
+    from System.Runtime.InteropServices import RuntimeInformation
+
+    try:
+        tfm = AppDomain.CurrentDomain.SetupInformation.TargetFrameworkName
+    except Exception as exc:  # noqa: BLE001 — diagnostics only
+        tfm = f"<unreadable: {exc}>"
+    runtime = (f"[runtime={RuntimeInformation.FrameworkDescription!r} "
+               f"TargetFrameworkName={tfm!r}]")
+
+    http_url = shell._window_url(8766, "127.0.0.1", 8765, view="diag", bust=42)
+    u = Uri(http_url)
+    assert str(u.AbsoluteUri) == http_url, runtime
+    assert str(u.Query) == "?b=42&ws=ws://127.0.0.1:8765&view=diag", runtime
+
+    fallback = shell._window_url(None, "127.0.0.1", 8765, view="diag", bust=42)
+    fb = str(Uri(fallback).AbsoluteUri)
+    assert "#b=42" in fb and "ws=ws" in fb, f"{fb} {runtime}"
+    assert "%3F" not in fb and "%23" not in fb, f"{fb} {runtime}"
 
 
 def _get(port, path):
@@ -83,6 +131,11 @@ def test_web_server_does_not_serve_outside_the_web_dir():
 
 
 def test_web_server_falls_back_to_an_ephemeral_port_when_the_wanted_one_is_taken():
+    # POSIX passes this trivially — binding over a LIVE listener is EADDRINUSE
+    # with or without SO_REUSEADDR. Windows CI is where it earns its keep:
+    # there SO_REUSEADDR lets a bind STEAL the listener (port == held), so this
+    # doubles as the regression test for _Server.allow_reuse_address being off
+    # on Windows.
     held, stop_held = _serve_or_skip()         # squat on the preferred port
     try:
         port, shutdown = shell._serve_web(shell.WEB_DIR, held)

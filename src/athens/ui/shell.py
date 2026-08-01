@@ -177,6 +177,27 @@ def _serve_web(directory: Path, want_port: int):
     return httpd.server_port, shutdown
 
 
+def _window_url(web_port: int | None, host: str, port: int,
+                view: str | None = None, bust: int | None = None) -> str:
+    """The exact URL the window opens — kept pure (`bust` injectable) so tests
+    can round-trip the PRODUCTION string through System.Uri instead of
+    re-deriving it (see test_shell.py).
+
+    Loopback HTTP when the web server bound; otherwise file:// with the params
+    handed over as a FRAGMENT, not a query — '?' is what file:// can't carry
+    through .NET's Uri (see _serve_web), '#' survives it. app.js reads either.
+    `bust` is the per-launch cache-buster: belt-and-braces behind the no-store
+    header over HTTP, and the only cache defense on the file:// fallback
+    (WKWebView caches file:// documents by URL)."""
+    import time
+    params = f"b={int(time.time()) if bust is None else bust}&ws=ws://{host}:{port}"
+    if view:
+        params += f"&view={view}"
+    if web_port:
+        return f"http://127.0.0.1:{web_port}/index.html?{params}"
+    return (WEB_DIR / "index.html").as_uri() + f"#{params}"
+
+
 def _library_path():
     """Persistent library location — the library is the archive (firmware
     updates can wipe the device's stored maps)."""
@@ -332,19 +353,10 @@ def launch(host: str = "127.0.0.1", port: int = 8765,
         # a packaging miss (datas not collected) would otherwise surface as a
         # bare "file not found" page with nothing pointing at the cause
         log.critical("UI assets are missing: no %s (web dir %s)", index, WEB_DIR)
-    # per-launch cache-buster — belt-and-braces behind the no-store header
-    import time
-    params = f"b={int(time.time())}&ws=ws://{host}:{port}"
-    if view:
-        params += f"&view={view}"
     # the UI port trails the API port so both shift together with --port and two
     # Athens instances keep distinct, stable origins
     web_port, web_shutdown = _serve_web(WEB_DIR, port + 1)
-    # the fallback hands the params over as a FRAGMENT, not a query: '?' is what
-    # file:// can't carry through .NET's Uri (see _serve_web), '#' survives it.
-    # app.js reads either.
-    url = (f"http://127.0.0.1:{web_port}/index.html?{params}" if web_port
-           else index.as_uri() + f"#{params}")
+    url = _window_url(web_port, host, port, view)
     if web_shutdown:
         atexit.register(web_shutdown)
     log.info("UI assets: %s -> %s", WEB_DIR, url)

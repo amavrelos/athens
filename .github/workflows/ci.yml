@@ -21,3 +21,33 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: python -m pip install -e ".[midi,osc,ui,dev]"
       - run: python -m pytest tests/ -q
+
+  # Build the real PyInstaller bundle and assert the datas landed — UI assets,
+  # DAW scripts, WebView2 DLLs (Windows), the info_plist block (macOS). The
+  # 0.1.1 ERR_FILE_NOT_FOUND spent a diagnosis cycle on "maybe the datas never
+  # landed" because only tag builds ever packaged anything, and nothing looked
+  # inside. Main pushes only: a multi-minute build has no place on PR loops.
+  bundle:
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[midi,osc,ui,package]"
+      # the icons are build-time artifacts (not committed) — same steps as
+      # scripts/build-macos.sh and scripts/build-windows.ps1
+      - name: Build Athens.icns from the iconset
+        if: runner.os == 'macOS'
+        run: iconutil -c icns packaging/Athens.iconset -o packaging/Athens.icns
+      - name: Build Athens.ico from the iconset
+        if: runner.os == 'Windows'
+        run: |
+          python -c "from PIL import Image; Image.open('packaging/Athens.iconset/icon_512x512.png').save('packaging/Athens.ico', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
+      - run: python -m PyInstaller --noconfirm Athens.spec
+      - run: python scripts/check_bundle.py
