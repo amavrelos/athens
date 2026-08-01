@@ -109,6 +109,7 @@ def _serve_web(directory: Path, want_port: int):
     there). Returns (None, None) if it can't bind, so a failure here degrades to
     a file:// URL instead of no window at all."""
     import functools
+    import socketserver
     from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
     class _Server(ThreadingHTTPServer):
@@ -117,6 +118,15 @@ def _serve_web(directory: Path, want_port: int):
         # a port another process is actively listening on, so there we'd rather
         # lose the fixed port to the fallback than take someone else's.
         allow_reuse_address = not sys.platform.startswith("win")
+
+        def server_bind(self):
+            # HTTPServer.server_bind() fills in server_name with socket.getfqdn()
+            # — a REVERSE DNS lookup, on a machine that may have no resolver for
+            # 127.0.0.1. It blocks the whole startup while it times out, long
+            # enough to trip launch()'s 20s watchdog and kill the app before the
+            # window opens. Nothing here reads server_name, so bind and skip it.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
 
     class _Handler(SimpleHTTPRequestHandler):
         # Windows resolves MIME types through the registry, where .css and .js

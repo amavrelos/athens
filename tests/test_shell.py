@@ -94,6 +94,24 @@ def test_web_server_falls_back_to_an_ephemeral_port_when_the_wanted_one_is_taken
         stop_held()
 
 
+def test_web_server_binds_without_reverse_dns(monkeypatch):
+    # http.server's own server_bind() calls socket.getfqdn() on the bind address.
+    # That is a reverse DNS lookup, and on a machine with no resolver for
+    # 127.0.0.1 it blocks past launch()'s 20s watchdog, killing the app before
+    # the window opens (CI caught exactly this on macOS). Nothing may resolve.
+    import socket
+
+    def boom(*_a):
+        raise AssertionError("reverse DNS lookup on the bind path")
+
+    monkeypatch.setattr(socket, "getfqdn", boom)
+    port, shutdown = shell._serve_web(shell.WEB_DIR, 0)
+    try:
+        assert port and _get(port, "/index.html").status == 200
+    finally:
+        shutdown()
+
+
 def _serve_or_skip(want=0):
     port, shutdown = shell._serve_web(shell.WEB_DIR, want)
     assert port, "could not bind the loopback web server"
