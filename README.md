@@ -71,6 +71,8 @@ Documents/Steinberg/<your Cubase>/MIDI Remote/Driver Scripts/Local/Melbourne Ins
 ```
 (under `~/Documents/…` on macOS, `%USERPROFILE%\Documents\…` on Windows.) Then open **Studio → MIDI Remote Manager** (or relaunch Cubase) so it rescans and finds it.
 
+⚠️ **Cubase also needs a virtual MIDI port pair named `roto-bridge`** — the script and Athens talk through it, and dropping the script in isn't enough on its own. On macOS that's an **IAC Driver** port; on Windows there's no built-in virtual MIDI, so you'll need [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html). **[Full Cubase setup and troubleshooting →](cubase/README.md)**
+
 *Pro Tools* — nothing to copy: it speaks **HUI** over a macOS **IAC bus**. Enable an IAC bus in **Audio MIDI Setup**, then in Pro Tools **Setup → Peripherals → MIDI Controllers** add a **HUI** with Receive From / Send To both set to that bus. Athens binds to the same bus when it launches.
 
 **After Athens updates a script**, the DAW still has to reload it: in Reaper, re-run the `roto_fx_feed` action; in Cubase, refresh the MIDI Remote Manager (or relaunch).
