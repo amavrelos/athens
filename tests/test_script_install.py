@@ -104,6 +104,40 @@ def test_reaper_override_used_for_portable_install(tmp_path, monkeypatch):
     assert (portable / "Scripts" / si.REAPER_TOGGLE).read_bytes() == b"-- lua"
 
 
+def test_reaper_override_moves_the_feed_dir_too(tmp_path, monkeypatch):
+    """The Lua derives EVERYTHING from GetResourcePath(): a Located portable
+    REAPER (resource dir next to reaper.exe — the common Windows case) beats
+    its heartbeat under the PORTABLE root, so the feed/detection dir must
+    follow the SAME override as the script drop. Resolving only the platform
+    default there left reaper_feed_live() False forever — REAPER running, the
+    script running, Athens saying 'closed', no error anywhere."""
+    from athens.daw.fx_feed import default_feed_dir
+    monkeypatch.setattr(si, "_config_dir", lambda: tmp_path / "cfg")
+    portable = tmp_path / "PortableReaper"
+    portable.mkdir()
+    si.set_override("reaper", str(portable))
+    assert si.reaper_resource_root() == portable
+    assert default_feed_dir() == portable / "roto-reaper"
+    si.set_override("reaper", None)                     # back to auto-discovery
+    assert si.reaper_resource_root() == si.reaper_resource_dir()
+
+
+def test_reaper_override_forgives_a_scripts_pick(tmp_path, monkeypatch):
+    # the Locate dialog asks for the resource folder, but picking Scripts/
+    # itself is a natural slip — normalise to its parent (the resource root),
+    # like the Cubase resolver descends into a picked host folder. Without it
+    # the scripts land in Scripts/Scripts and the feed watches Scripts/roto-
+    # reaper while the Lua writes to <resource>/roto-reaper: same dead end.
+    from athens.daw.fx_feed import default_feed_dir
+    monkeypatch.setattr(si, "_config_dir", lambda: tmp_path / "cfg")
+    portable = tmp_path / "PortableReaper"
+    (portable / "Scripts").mkdir(parents=True)
+    si.set_override("reaper", str(portable / "Scripts"))
+    assert si.reaper_resource_root() == portable
+    assert si.reaper_scripts_dir() == portable / "Scripts"
+    assert default_feed_dir() == portable / "roto-reaper"
+
+
 def test_status_reports_located_and_found(tmp_path, monkeypatch):
     monkeypatch.setattr(si, "_config_dir", lambda: tmp_path / "cfg")
     driver = tmp_path / "DS"

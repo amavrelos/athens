@@ -97,6 +97,29 @@ def test_learn_file_signals_arm(tmp_path):
     feed.set_learn(False)                              # idempotent when absent
 
 
+def test_retarget_moves_the_feed_to_a_new_dir(tmp_path):
+    """The user Located a (portable) REAPER mid-run: the feed must follow the
+    new IPC dir immediately — old-dir files wiped (no ghost session left
+    behind), per-dir seq/stamp memory forgotten so the new dir's files deliver
+    even if their seq happens to match what the old dir already sent."""
+    a, b = tmp_path / "old", tmp_path / "portable"
+    a.mkdir(), b.mkdir()
+    feed = ReaperFxFeed(a)
+    chains = []
+    feed.on_chain = chains.append
+    _write(a / "chain.json", json.dumps(_chain(seq=7)))
+    feed.poll_once()
+    assert len(chains) == 1
+
+    feed.retarget(b)
+    assert feed.dir == b
+    assert not (a / "chain.json").exists()             # old dir left clean
+
+    _write(b / "chain.json", json.dumps(_chain(seq=7)))   # SAME seq as before
+    feed.poll_once()
+    assert len(chains) == 2                            # counters were reset
+
+
 # --- ReaperSysexSource integration ---------------------------------------------
 
 def _source(tmp_path):

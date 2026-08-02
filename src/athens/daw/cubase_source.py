@@ -29,6 +29,11 @@ from typing import List, Optional
 
 from ..roto.sysex_client import MidiPort
 from . import cubase_contract as wire
+# BRIDGE_PORT/find_bridge_port: the ONE case-insensitive matcher, shared with
+# detection — a port that passes the detect probe must also open here, and two
+# hand-rolled matchers once drifted (case-sensitive vs not) into exactly that
+# pass-then-fail split.
+from .detect import BRIDGE_PORT, find_bridge_port
 from .echo import EchoGate
 from .source import (
     TRACK_FLAGS, DeviceInfo, PluginParam, SysexDawSource, TrackInfo,
@@ -36,9 +41,6 @@ from .source import (
 )
 
 log = logging.getLogger(__name__)
-
-BRIDGE_PORT = "roto-bridge"          # macOS exposes the JS's virtual pair as
-                                     # "IAC Driver roto-bridge" — match by substring
 # Cubase's MIDI Remote script goes briefly silent when it re-binds/reloads (seen
 # ~8 s on a plugin/track change). Don't blank the device on the first missed
 # keepalive — only declare the session gone after this long of CONTINUOUS
@@ -96,10 +98,8 @@ class CubaseSysexSource(SysexDawSource):
             try:
                 import mido
                 from ..roto.sysex_client import MidoMidiPort
-                inp = next((n for n in mido.get_input_names()
-                            if BRIDGE_PORT in n), None)
-                outp = next((n for n in mido.get_output_names()
-                             if BRIDGE_PORT in n), None)
+                inp = find_bridge_port(mido.get_input_names())
+                outp = find_bridge_port(mido.get_output_names())
                 if inp is None or outp is None:
                     raise RuntimeError("no MIDI port containing %r" % BRIDGE_PORT)
                 self._port = MidoMidiPort(inp, outp)

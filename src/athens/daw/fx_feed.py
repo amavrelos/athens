@@ -62,8 +62,16 @@ def reaper_resource_dir() -> Path:
 
 
 def default_feed_dir() -> Path:
-    """<REAPER resource path>/roto-reaper for the current platform."""
-    return reaper_resource_dir() / "roto-reaper"
+    """<REAPER resource path>/roto-reaper — off the SAME resource root the
+    script installer targets, i.e. a user 'Locate' override (portable REAPER,
+    the resource dir next to reaper.exe) wins over the platform default. The
+    Lua derives its dir from reaper.GetResourcePath(), so a Located portable
+    install beats its heartbeat under the PORTABLE root: resolving only the
+    default here left reaper_feed_live() False forever — REAPER running, the
+    script running, Athens saying "closed", no error anywhere. Lazy import:
+    script_install imports this module at load."""
+    from .script_install import reaper_resource_root
+    return reaper_resource_root() / "roto-reaper"
 
 
 class ReaperFxFeed:
@@ -130,6 +138,30 @@ class ReaperFxFeed:
             self._thread = None
         self._wipe()
 
+    def retarget(self, directory: Optional[os.PathLike] = None) -> None:
+        """Re-point the feed at a new IPC dir mid-run — the user just Located a
+        (portable) REAPER, and the Lua there writes under ITS resource root.
+        The dir is resolved at construction, so without this only sources built
+        AFTER the Locate would heal; the running one kept polling the old,
+        forever-dead dir until an app relaunch. stop() first (it also wipes the
+        OLD dir's IPC files, so no stale chain.json survives to ghost a future
+        session), then forget every per-dir stamp/seq/heartbeat memory and — if
+        the feed was running — start over on the new dir."""
+        was_running = self._thread is not None and self._thread.is_alive()
+        self.stop()
+        self.dir = Path(directory) if directory is not None \
+            else default_feed_dir()
+        self._stamps.clear()
+        self._mtimes.clear()
+        self._chain_seq = self._live_seq = self._touched_seq = -1
+        self._script_version = None
+        self._hb_mtime = None
+        self._hb_last_beat = 0.0
+        self._hb_ever = False
+        self._alive = False
+        if was_running:
+            self.start()
+
     def _wipe(self) -> None:
         """Clean exit: remove the IPC files so nothing stale is left behind — a
         chain.json lingering from a past REAPER session can put a ghost session
@@ -146,34 +178,47 @@ class ReaperFxFeed:
                     pass
 
     # -- py -> Lua ------------------------------------------------------------
+    # All three writers are best-effort: on Windows a replace/remove can hit a
+    # sharing violation while the Lua momentarily holds the same file open for
+    # its own read (CPython opens without FILE_SHARE_DELETE). Files are state,
+    # not queues — drop THIS write instead of raising into the bridge/serial
+    # thread that called us; the next change rewrites the full state anyway.
+
     def write_watch(self, params: List[Tuple[int, int]]) -> None:
         """Publish the (fx, param) pairs the Lua script should stream."""
-        tmp = self.dir / (WATCH_FILE + ".tmp")
-        self.dir.mkdir(parents=True, exist_ok=True)
-        tmp.write_text("".join(f"{fx} {param}\n" for fx, param in params))
-        tmp.replace(self.dir / WATCH_FILE)
+        try:
+            tmp = self.dir / (WATCH_FILE + ".tmp")
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp.write_text("".join(f"{fx} {param}\n" for fx, param in params))
+            tmp.replace(self.dir / WATCH_FILE)
+        except OSError as exc:
+            log.warning("watch.txt write dropped (next change retries): %s", exc)
 
     def set_learn(self, armed: bool) -> None:
         """Signal the Lua to run move-detection (offer the param the user moves)
         while learn is armed. Presence of learn.txt = armed."""
-        self.dir.mkdir(parents=True, exist_ok=True)
         path = self.dir / LEARN_FILE
-        if armed:
-            path.write_text("1")
-        else:
-            try:
+        try:
+            if armed:
+                self.dir.mkdir(parents=True, exist_ok=True)
+                path.write_text("1")
+            else:
                 path.unlink()
-            except OSError:
-                pass
+        except OSError as exc:
+            if armed:      # a failed un-arm just leaves the file for _wipe
+                log.warning("learn.txt write dropped: %s", exc)
 
     def write_command(self, command: str) -> None:
         """One command line for the Lua to apply and delete: 'focus <fx>' or
         'enable <fx> <0|1>'. Last write wins if the previous one wasn't
         consumed yet — acceptable for single user gestures."""
-        self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.dir / (CMD_FILE + ".tmp")
-        tmp.write_text(command + "\n")
-        tmp.replace(self.dir / CMD_FILE)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.dir / (CMD_FILE + ".tmp")
+            tmp.write_text(command + "\n")
+            tmp.replace(self.dir / CMD_FILE)
+        except OSError as exc:
+            log.warning("cmd.txt write dropped: %s", exc)
 
     # -- poll loop -------------------------------------------------------------
     def _run(self) -> None:

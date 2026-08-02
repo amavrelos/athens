@@ -17,9 +17,61 @@ actually talking to Athens, not merely one that happens to be open.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 
 log = logging.getLogger(__name__)
+
+BRIDGE_PORT = "roto-bridge"   # canonical name of the Cubase bridge pair
+
+# Outcome of the LAST detect_daw call: True when nothing announced itself and
+# the hardcoded `default` was returned. BridgeService ships this to the UI so a
+# fallback is never presented as a detection — "REAPER detected" when REAPER
+# was merely assumed sent Windows users chasing the wrong DAW entirely.
+last_detect_fell_back = False
+
+
+def find_bridge_port(names) -> str | None:
+    """Pick the roto-bridge port out of a name list — case-INSENSITIVELY, in
+    ONE place. macOS presents the IAC pair as "IAC Driver roto-bridge" and a
+    hand-typed loopMIDI port may be "Roto-Bridge": detection and the Cubase
+    source MUST share this matcher, or a port can pass the probe and then fail
+    to open (they drifted exactly that way once)."""
+    return next((n for n in names if BRIDGE_PORT in n.lower()), None)
+
+
+def bridge_port_missing() -> bool:
+    """Is the roto-bridge pair absent from the MIDI port list? ENUMERATION
+    only — listing ports is free, so unlike a probe this stays safe while the
+    device port floods (OPENING a port then deadlocks CoreMIDI; see
+    detect_daw). False when MIDI itself is unavailable: nothing actionable."""
+    try:
+        import mido
+        return (find_bridge_port(mido.get_input_names()) is None
+                or find_bridge_port(mido.get_output_names()) is None)
+    except Exception:      # noqa: BLE001 - no midi extra / backend hiccup
+        return False
+
+
+def bridge_port_hint() -> str:
+    """Platform-correct remedy for a missing roto-bridge pair, worded for the
+    UI. Windows has NO built-in virtual MIDI — a fresh machine simply has no
+    such port, Cubase can never announce itself, and detect_daw silently falls
+    back; the loopMIDI AUTOSTART step is essential because its ports are
+    per-user and exist only while loopMIDI runs (skip it and the port vanishes
+    on reboot, silently reintroducing the same failure)."""
+    if sys.platform == "win32":
+        return ("Cubase users: no 'roto-bridge' MIDI port exists — install "
+                "loopMIDI (winget install TobiasErichsen.loopMIDI), add a port "
+                "named exactly 'roto-bridge', and enable 'Autostart loopMIDI' "
+                "(without it the port vanishes on reboot).")
+    if sys.platform == "darwin":
+        return ("Cubase users: no 'roto-bridge' MIDI port exists — in Audio "
+                "MIDI Setup ▸ Window ▸ Show MIDI Studio, double-click the IAC "
+                "Driver, tick 'Device is online', and add a port named "
+                "'roto-bridge'.")
+    return ("Cubase users: no 'roto-bridge' MIDI port exists — create a "
+            "virtual MIDI port pair named 'roto-bridge'.")
 
 
 def reaper_feed_live(gone_after: float | None = None) -> bool:
@@ -42,10 +94,8 @@ def cubase_bridge_live(timeout: float = 1.0) -> bool:
         return False
     from . import cubase_contract as wire
 
-    def _match(names):
-        return next((n for n in names if "roto-bridge" in n.lower()), None)
-    inp = _match(mido.get_input_names())
-    outp = _match(mido.get_output_names())
+    inp = find_bridge_port(mido.get_input_names())
+    outp = find_bridge_port(mido.get_output_names())
     if not inp or not outp:
         return False
 
@@ -117,12 +167,19 @@ def detect_daw(default: str = "reaper", cubase_timeout: float = 3.0) -> str:
     freezes every thread (un-interruptible hang). The runtime
     monitor in BridgeService therefore detects only what's free: REAPER's
     heartbeat file-stat, and an already-open Cubase source on its own port.
+
+    Records whether the DEFAULT was returned in `last_detect_fell_back` — a
+    fallback is a guess, not a detection, and the UI must word its connect
+    hints accordingly (see BridgeService._daw_detected).
     """
+    global last_detect_fell_back
+    last_detect_fell_back = False
     if reaper_feed_live():
         log.info("auto-detect DAW: reaper (reascript heartbeat is live)")
         return "reaper"
     if cubase_bridge_live(cubase_timeout):
         log.info("auto-detect DAW: cubase (bridge script answered HELLO)")
         return "cubase"
+    last_detect_fell_back = True
     log.info("auto-detect DAW: %s (default — no feed announced itself)", default)
     return default

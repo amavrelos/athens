@@ -69,3 +69,34 @@ def test_grace_suppresses_early_gone(monkeypatch):
     clock["t"] += rs._LIVE_GRACE_S - 0.5   # still inside the grace
     src._live_poll()
     assert edges == []                     # silence tolerated during grace
+
+
+def test_osc_silent_flags_a_mute_surface_after_grace(monkeypatch):
+    """The inverse hole: the feed beats (REAPER alive) but the OSC surface has
+    NEVER spoken — the Preferences>Control/OSC/web device was never added, so
+    the mixer stays empty and knob writes vanish while everything looks green.
+    Reported only after the feed-alive grace (a configured REAPER answers our
+    refresh within a beat) and cleared for good by the first packet."""
+    src, clock = _src(monkeypatch, 100.0)
+    src._server = object()                 # recv socket bound, python-osc there
+    src._on_feed_daw_alive(True)           # heartbeat: REAPER is alive
+    assert src.osc_silent() is False       # inside the grace: not yet a verdict
+    clock["t"] += rs._OSC_GONE_S + 1.0
+    assert src.osc_silent() is True        # alive + bound + never one packet
+    src._seen_osc()                        # first packet: configured after all
+    assert src.osc_silent() is False
+
+
+def test_osc_silent_needs_feed_and_a_socket_story(monkeypatch):
+    src, clock = _src(monkeypatch, 100.0)
+    src._on_feed_daw_alive(True)
+    clock["t"] += rs._OSC_GONE_S + 1.0
+    # no server and no bind error = python-osc missing: a different, already-
+    # logged problem — the "add the OSC surface" hint would be a wrong remedy
+    assert src.osc_silent() is False
+    src.osc_bind_error = "[WinError 10048] only one usage of each socket"
+    assert src.osc_silent() is True        # lost the port: same user-visible hole
+    src.osc_bind_error = ""
+    src._server = object()
+    src._on_feed_daw_alive(False)          # feed gone: that's the 'closed' path
+    assert src.osc_silent() is False

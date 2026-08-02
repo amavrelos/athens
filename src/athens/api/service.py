@@ -68,6 +68,13 @@ class BridgeService:
         self._auto_daw = (daw == "auto")
         self._daw_mode = daw            # which companion scripts to keep current
         self._active_daw = getattr(self.source, "DAW_NAME", "DAW").lower()
+        # Did the active DAW actually ANNOUNCE itself (startup detection, a
+        # liveness edge, a hot-swap), or is it merely detect_daw's hardcoded
+        # fallback default? The UI words its connect hint off this — a fallback
+        # rendered as "REAPER detected" sent users chasing the wrong DAW when
+        # the real problem was e.g. a missing roto-bridge port.
+        from ..daw import detect as _detect
+        self._daw_detected = not (self._auto_daw and _detect.last_detect_fell_back)
         self._daw_lock = threading.Lock()
         # ROTO attach/detach is driven from three threads (the hot-plug poller,
         # the connect/disconnect RPCs, and the serial reader's device-lost) —
@@ -82,6 +89,7 @@ class BridgeService:
         self.client: Optional[RotoLogicClient] = None
         self.bridge = None      # LogicBridge, created on connect
         self.roto: Optional[RotoControl] = None      # serial config channel
+        self._cc_out = None     # virtual "Athens" MIDI out (plugin-CC mappings)
         self._connected = False
         self._connected_at = 0.0
         self._device_mode = ""  # last mode the hardware announced
@@ -114,6 +122,16 @@ class BridgeService:
         #                                   STATE, not just an event — the check can
         #                                   fire ms after launch, before any UI is
         #                                   connected to hear a one-shot notice.
+        self._bridge_port_missing = False  # no MIDI pair matching roto-bridge —
+        self._bridge_port_hint = ""        # Cubase can never announce itself
+        #                                    (the Windows no-virtual-MIDI trap).
+        #                                    STATE like _script_stale, so a
+        #                                    late-joining UI still sees it.
+        self._reaper_osc_missing = False   # REAPER's feed beats but its OSC
+        self._reaper_osc_hint = ""         # surface never spoke — the one-time
+        #                                    Preferences>Control/OSC/web device
+        #                                    is missing (or UDP 8000 is
+        #                                    squatted). Same STATE pattern.
         self._pending_learn_ref: Optional[dict] = None
         # user settings (assignable transport buttons, ...) — the bridge
         # applies them, so they live app-side, not in the web UI
@@ -139,6 +157,17 @@ class BridgeService:
     # -- lifecycle -----------------------------------------------------------
     def start(self) -> None:
         self._started = True
+        # returning users with CC-learn maps: stand the virtual 'Athens' port
+        # up at launch so the DAW's remembered MIDI-input routing finds it
+        if self._cc_out is None and any(
+                r.get("cc") is not None
+                for plug in self._param_refs.values() for r in plug.values()):
+            try:
+                from ..daw.cc_out import CcOut
+                self._cc_out = CcOut()
+            except Exception:  # noqa: BLE001 - launch must not depend on MIDI
+                log.warning("couldn't open the virtual 'Athens' CC port at "
+                            "launch — the first CC send will retry")
         if self._auto:
             self._sync_daw_scripts()    # keep the DAW companions current
         # REAPER and the device are INDEPENDENT endpoints: the DAW feed runs
@@ -151,17 +180,26 @@ class BridgeService:
         # its own already-open port and swap to it (a runtime MIDI open deadlocks).
         if self._auto_daw:
             self._start_cubase_watch()
+        # A missing roto-bridge pair is a first-class condition, not a debug
+        # log: without it the Cubase probe can't run, detect_daw silently falls
+        # back, and the watcher can never adopt Cubase — invisible unless
+        # surfaced HERE. Skipped for an explicit non-Cubase --daw (the pair is
+        # not in play, so don't nag a REAPER-only setup).
+        if self._auto_daw or self._active_daw == "cubase":
+            self._check_bridge_port()
         if self._auto:
             # the ROTO is possibly already plugged in — connect without
             # making the user click anything
             import threading
             threading.Thread(target=self._auto_connect, daemon=True,
                              name="auto-connect").start()
-        if self._auto_daw:
-            # follow whichever DAW is live, whatever the start order
-            import threading
-            threading.Thread(target=self._daw_monitor, daemon=True,
-                             name="daw-monitor").start()
+        # the monitor always runs — it is the app's only periodic service-side
+        # pulse, and the standing diagnostics (mute-OSC REAPER, a roto-bridge
+        # pair appearing/vanishing) need re-checking in EVERY mode; the tick
+        # itself gates the hot-swap logic to --daw auto
+        import threading
+        threading.Thread(target=self._daw_monitor, daemon=True,
+                         name="daw-monitor").start()
         self._check_system_permissions()
         log.info("BridgeService started (attached=%s)", self.bridge is not None)
 
@@ -196,6 +234,14 @@ class BridgeService:
         script_install.set_override(daw, path)
         notes = script_install.sync(daw)
         self._publish_reload_notice(notes)
+        # a REAPER Locate moves the feed's IPC dir too (the Lua writes under
+        # ITS resource root) — re-point the RUNNING source so the heartbeat in
+        # the new folder is seen now, not after an app relaunch. Detection
+        # (reaper_feed_live) re-resolves the override on every call by itself.
+        if (daw or "").lower() == "reaper":
+            retarget = getattr(self.source, "retarget_feed", None)
+            if callable(retarget):
+                retarget()
         log.info("script folder for %s -> %s (%s)", daw, path or "(auto)",
                  "; ".join(notes) or "already current")
         return {"status": script_install.status(), "notes": notes}
@@ -341,6 +387,9 @@ class BridgeService:
         if self.roto is not None:
             self.roto.close()
             self.roto = None
+        if self._cc_out is not None:
+            self._cc_out.close()
+            self._cc_out = None
 
     # -- device attachment ------------------------------------------------------
     def _attach_midi(self, port: MidiPort) -> None:
@@ -362,6 +411,10 @@ class BridgeService:
         # identity-hash map (built from the persisted learn refs) so a knob
         # learned in one DAW drives the same param in another
         self.bridge.param_identity_resolver = self._param_identity_for_plugin
+        # plugin-internal CC mappings: which device knobs bypass the DAW's
+        # param API and speak the plugin's own learned MIDI CC instead
+        self.bridge.cc_map_resolver = self._cc_map_for_plugin
+        self.bridge.cc_sender = self._cc_send
         # remember the DAW's full param identity for each learn — the serial
         # LEARNED event supplies the landing slot to pair it with
         self.bridge.on_learn_reference = self._stash_learn_ref
@@ -482,6 +535,24 @@ class BridgeService:
 
     def _stash_learn_ref(self, ref: dict) -> None:
         self._pending_learn_ref = ref
+
+    def _cc_map_for_plugin(self, plugin_hash: bytes) -> dict:
+        """{device_index -> (channel, cc)} for a plugin's CC-mapped controls,
+        from the persisted refs. These knobs never touch the DAW's param API —
+        the bridge relays them as the plugin's own learned MIDI CC."""
+        out: dict = {}
+        for ref in self._param_refs.get(plugin_hash.hex(), {}).values():
+            if ref.get("cc") is not None and ref.get("device_index") is not None:
+                out[int(ref["device_index"])] = \
+                    (int(ref.get("channel", 1)), int(ref["cc"]))
+        return out
+
+    def _cc_send(self, channel: int, cc: int, value: float) -> None:
+        """Emit one CC on the virtual 'Athens' port (opened on first use)."""
+        if self._cc_out is None:
+            from ..daw.cc_out import CcOut
+            self._cc_out = CcOut()      # RuntimeError with remedy on failure
+        self._cc_out.send_cc(channel, cc, value)
 
     def _save_param_refs(self) -> None:
         if self._param_refs_path is not None:
@@ -661,11 +732,82 @@ class BridgeService:
             return "SysEx " + bytes(data).hex(" ")
 
     def _publish_daw_alive(self, alive: bool) -> None:
+        if alive:
+            self._daw_detected = True   # it answered — no longer a fallback guess
         self._daw_alive = alive
         self.bus.publish("daw", {"alive": alive,
-                                 "name": getattr(self.source, "DAW_NAME", "DAW")})
+                                 "name": getattr(self.source, "DAW_NAME", "DAW"),
+                                 "detected": self._daw_detected})
         self.bus.publish("tracks", self._tracks_snapshot())
         self.bus.publish("devices", self._devices_snapshot())
+
+    def _check_bridge_port(self) -> None:
+        """Surface a missing roto-bridge pair to the UI (state + event + a
+        one-shot notice — the _script_stale pattern). Port ENUMERATION only,
+        never an open: listing names is free, but opening a MIDI port while
+        the device port floods deadlocks CoreMIDI (see _monitor_tick). A bound
+        Cubase source proves the pair exists without even enumerating."""
+        cub = self._cubase if self._cubase is not None else (
+            self.source if self._active_daw == "cubase" else None)
+        if cub is not None and cub.feed_running():
+            missing = False             # bound = the pair exists; nothing to list
+        else:
+            from ..daw import detect
+            missing = detect.bridge_port_missing()
+        if missing == self._bridge_port_missing:
+            return                      # edge-triggered, like the alive edges
+        if missing:
+            from ..daw import detect
+            self._bridge_port_hint = detect.bridge_port_hint()
+            log.warning("no MIDI port matching 'roto-bridge' — %s",
+                        self._bridge_port_hint)
+        else:
+            self._bridge_port_hint = ""
+            log.info("roto-bridge MIDI pair present")
+        self._bridge_port_missing = missing
+        self.bus.publish("bridge_port", {"missing": missing,
+                                         "hint": self._bridge_port_hint})
+        if missing:                     # live nudge for an already-open UI
+            self.bus.publish("notice", {"text": self._bridge_port_hint})
+
+    def _check_reaper_osc(self) -> None:
+        """Surface a beating-feed-but-mute-OSC REAPER (state + event + one-shot
+        notice — the _bridge_port_missing pattern). The two channels are
+        SEPARATE one-time setups: the ReaScript heartbeat proves REAPER is
+        alive, so an OSC surface that has NEVER spoken means the Preferences >
+        Control/OSC/web device is missing (or our UDP 8000 recv socket lost a
+        bind fight). Without this the app looks healthy — 'REAPER' green off
+        the heartbeat — while the mixer stays empty and every knob write is
+        dropped, with nothing but silence to debug. Free (timestamp reads via
+        the source's osc_silent), so safe on every monitor tick."""
+        src = self.source
+        probe = getattr(src, "osc_silent", None) \
+            if self._active_daw == "reaper" else None
+        silent = bool(callable(probe) and probe())
+        if silent == self._reaper_osc_missing:
+            return                      # edge-triggered, like the port check
+        if silent:
+            bind_err = getattr(src, "osc_bind_error", "")
+            self._reaper_osc_hint = (
+                "Athens couldn't open UDP port %s for REAPER's OSC feedback "
+                "(%s) — another app owns the port; free it and relaunch "
+                "Athens." % (getattr(src, "_osc_recv", ("", 8000))[1], bind_err)
+                if bind_err else
+                "REAPER is running the Roto feed script but no OSC arrives — "
+                "in REAPER: Preferences ▸ Control/OSC/web ▸ Add ▸ 'OSC (Open "
+                "Sound Control)', mode 'Configure device IP+local port', "
+                "device port 8000, local listen port 9000. Until then the "
+                "mixer stays empty and knob moves are lost.")
+            log.warning("REAPER feed alive but OSC never spoke — %s",
+                        self._reaper_osc_hint)
+        else:
+            self._reaper_osc_hint = ""
+            log.info("REAPER OSC feedback flowing")
+        self._reaper_osc_missing = silent
+        self.bus.publish("reaper_osc", {"missing": silent,
+                                        "hint": self._reaper_osc_hint})
+        if silent:                      # live nudge for an already-open UI
+            self.bus.publish("notice", {"text": self._reaper_osc_hint})
 
     # -- runtime DAW hot-swap (--daw auto) -----------------------------------
     def _start_cubase_watch(self) -> None:
@@ -714,6 +856,16 @@ class BridgeService:
         Swap only when the CURRENT DAW has gone dead, so a live session is never
         yanked out from under the user."""
         from ..daw.detect import reaper_feed_live
+        # standing diagnostics first — they run in EVERY mode (this tick is the
+        # app's only periodic service-side pulse): the mute-OSC REAPER check,
+        # and the roto-bridge pair (can appear — loopMIDI started — or vanish
+        # at any time) wherever Cubase is in play, same gate as start().
+        # Enumeration only (free); a bound watcher short-circuits it entirely.
+        self._check_reaper_osc()
+        if self._auto_daw or self._active_daw == "cubase":
+            self._check_bridge_port()
+        if not self._auto_daw:
+            return                  # explicit --daw: never hot-swap the source
         # The standby Cubase watcher binds roto-bridge ONCE at startup; if that
         # port wasn't enumerated yet (Athens launched before the IAC bus was up
         # or before Cubase), it gave up and a later Cubase was never detected —
@@ -794,9 +946,12 @@ class BridgeService:
             refresh = getattr(new, "refresh_state", None)
             if callable(refresh):
                 refresh()
-        # refresh the UI: new DAW identity + fresh snapshots
+        # refresh the UI: new DAW identity + fresh snapshots. A swap target was
+        # CONFIRMED live (watcher answered / heartbeat fresh) — a detection.
         self._daw_alive = True
-        self.bus.publish("daw", {"alive": True, "name": new.DAW_NAME})
+        self._daw_detected = True
+        self.bus.publish("daw", {"alive": True, "name": new.DAW_NAME,
+                                 "detected": True})
         self.bus.publish("tracks", self._tracks_snapshot())
         self.bus.publish("devices", self._devices_snapshot())
 
@@ -892,8 +1047,16 @@ class BridgeService:
                 "tracks": [asdict(t) for t in tracks]}
 
     def _devices_snapshot(self) -> dict:
-        return {"selected": self.source.selected_device(),
-                "devices": [asdict(d) for d in self.source.devices()]}
+        devs = []
+        for d in self.source.devices():
+            item = asdict(d)
+            # the hash the bridge announces for this plugin (linked or raw) —
+            # lets the UI show mapping badges + target direct-map writes for any
+            # focused plugin, not only linked ones
+            if self.bridge is not None and hasattr(self.bridge, "_device_hash"):
+                item["hash"] = self.bridge._device_hash(d.name).hex()
+            devs.append(item)
+        return {"selected": self.source.selected_device(), "devices": devs}
 
     # -- RPC methods -----------------------------------------------------------
     def _register_methods(self) -> None:
@@ -912,6 +1075,11 @@ class BridgeService:
                 "attached": self.bridge is not None,
                 "mode": self._device_mode,
                 "daw_alive": self._daw_alive,
+                "daw_detected": self._daw_detected,
+                "bridge_port_missing": self._bridge_port_missing,
+                "bridge_port_hint": self._bridge_port_hint,
+                "reaper_osc_missing": self._reaper_osc_missing,
+                "reaper_osc_hint": self._reaper_osc_hint,
                 "script_stale": self._script_stale,
                 "selected_track": self.source.selected_track(),
                 "transport": asdict(self.source.transport()),
@@ -998,6 +1166,215 @@ class BridgeService:
         @rpc.method("device_params")
         def device_params(device: int) -> list:
             return [asdict(p) for p in self.source.device_params(int(device))]
+
+        @rpc.method("map_device_control")
+        def map_device_control(param: int, slot: int, kind: str = "knob",
+                               name: Optional[str] = None,
+                               colour: Optional[int] = None) -> dict:
+            """Directly bind a device knob/switch to a focused-plugin param over
+            serial — the 'pick knob + pick param in Athens' learn path, for
+            plugins the device-driven sweep can't learn (params that don't
+            report value changes). Writes the plugin's flash map with NO sweep,
+            records a param-ref so the map is cross-DAW reusable exactly like a
+            swept learn, then refreshes the device so the control renders. The
+            LogicBridge relays param-indexed values 1:1, so the written map just
+            works over the existing live path."""
+            if self.roto is None:
+                raise RpcError("serial not connected — plug in the ROTO's config port")
+            if self.bridge is None or not hasattr(self.bridge, "_device_hash"):
+                raise RpcError("no Logic-dialect device attached")
+            if kind not in ("knob", "switch"):
+                raise RpcError(f"unknown control kind: {kind}")
+            from ..protocol import codec as pcodec
+            from ..protocol.constants import KnobHaptic, RespCode, UNUSED_INDENT
+            from ..bridge.common import short_name
+
+            param, slot = int(param), int(slot)
+            if param >= 256:
+                raise RpcError("param index >= 256 is beyond the device's live "
+                               "value bus and can't be mapped")
+            if not 0 <= slot <= 0x3F:
+                raise RpcError("slot out of range (0-63)")
+            dev_index = self.source.selected_device()
+            dev = next((d for d in self.source.devices()
+                        if d.index == dev_index and d.name), None)
+            if dev is None:
+                raise RpcError("no plugin focused")
+            p = next((x for x in self.source.device_params(dev_index)
+                      if x.index == param), None)
+            if p is None:
+                raise RpcError(f"param {param} not on the focused plugin")
+
+            hash8 = self.bridge._device_hash(dev.name)
+            h6 = codec.param_hash(p.name)
+            label = (name if name else short_name(p.name))[:12]
+            col = max(0, min(127, int(colour) if colour is not None else 21))
+            steps = p.steps if 2 <= p.steps <= 10 else 0
+            with self.roto.config_update():
+                self.roto._req(pcodec.add_plugin(hash8, dev.name[:12]),
+                               ok_codes=(RespCode.SUCCESS, RespCode.PLUGIN_EXISTS))
+                if kind == "switch":
+                    self.roto._req(pcodec.set_plugin_switch_config(
+                        pcodec.PluginSwitchConfig(
+                            plugin_hash=hash8, control_index=slot,
+                            mapped_param_index=param, mapped_param_hash=h6,
+                            min_value=0, max_value=0x7F, name=label,
+                            colour=col, led_on=col, led_off=0, steps=steps)))
+                else:
+                    self.roto._req(pcodec.set_plugin_knob_config(
+                        pcodec.PluginKnobConfig(
+                            plugin_hash=hash8, control_index=slot,
+                            mapped_param_index=param, mapped_param_hash=h6,
+                            min_value=0, max_value=0x3FFF, name=label, colour=col,
+                            haptic=(KnobHaptic.KNOB_N_STEP if steps >= 2
+                                    else KnobHaptic.KNOB_300),
+                            indent1=UNUSED_INDENT, indent2=UNUSED_INDENT,
+                            steps=steps)))
+
+            # identity ref (same shape a swept learn stores): lets
+            # _daw_param_for_device_index resolve it + makes the map portable
+            self._param_refs.setdefault(hash8.hex(), {})[f"{kind}:{slot}"] = {
+                "hash": hash8.hex(), "fx_name": dev.name,
+                "param_index": param, "param_name": p.name,
+                "value": p.value, "display": p.display}
+            self._save_param_refs()
+            self._device_map_ids.pop(hash8.hex(), None)
+            self.bridge.refresh_plugin_context()   # reload flash map on device
+            self.bus.publish("device_map_changed",
+                             {"hash": hash8.hex(), "kind": kind, "slot": slot})
+            return {"written": True, "kind": kind, "slot": slot, "param": param,
+                    "hash": hash8.hex(), "name": label, "steps": steps}
+
+        # CCs safe to hand a plugin's own MIDI learn: the undefined/general
+        # ranges, skipping everything with baked-in meaning (mod wheel,
+        # volume/pan/expression, sustain, data entry, (N)RPN, channel mode)
+        CC_LEARN_POOL = (list(range(102, 120)) + list(range(20, 32))
+                         + list(range(52, 64)) + [3, 9, 14, 15, 85, 86, 87])
+
+        @rpc.method("map_device_control_cc")
+        def map_device_control_cc(slot: int, name: str, kind: str = "knob",
+                                  cc: Optional[int] = None,
+                                  channel: int = 1) -> dict:
+            """Bind a device knob/switch to a plugin's OWN MIDI-CC learn — for
+            plugins that never expose their panel controls as host params
+            (GForce et al: arm the plugin's CC learn, click the control, and it
+            waits for a CC). Athens picks a free CC, sends it once out the
+            virtual 'Athens' port so the armed plugin binds it, and writes the
+            knob to the ROTO under a synthetic param index; the bridge then
+            relays that knob as the same CC for good. The DAW never sees these
+            moves, so control is one-way by nature."""
+            if self.roto is None:
+                raise RpcError("serial not connected — plug in the ROTO's config port")
+            if self.bridge is None or not hasattr(self.bridge, "_device_hash"):
+                raise RpcError("no Logic-dialect device attached")
+            if kind not in ("knob", "switch"):
+                raise RpcError(f"unknown control kind: {kind}")
+            from ..protocol import codec as pcodec
+            from ..protocol.constants import KnobHaptic, RespCode, UNUSED_INDENT
+
+            slot, channel = int(slot), int(channel)
+            if not 0 <= slot <= 0x3F:
+                raise RpcError("slot out of range (0-63)")
+            if not 1 <= channel <= 16:
+                raise RpcError("MIDI channel out of range (1-16)")
+            label = (name or "").strip()[:12]
+            if not label:
+                raise RpcError("give the knob a label — the plugin can't "
+                               "supply a name for its own CC targets")
+            dev_index = self.source.selected_device()
+            dev = next((d for d in self.source.devices()
+                        if d.index == dev_index and d.name), None)
+            if dev is None:
+                raise RpcError("no plugin focused")
+            hash8 = self.bridge._device_hash(dev.name)
+            refs = self._param_refs.get(hash8.hex(), {})
+
+            # re-sending a slot's learn shot must be idempotent: the first try
+            # often lands before the 'Athens' input is enabled in the DAW, and
+            # a re-send with a NEW cc would strand the knob on the old one
+            prev = refs.get(f"{kind}:{slot}") or {}
+            if cc is None and prev.get("cc") is not None \
+                    and int(prev.get("channel", 1)) == channel:
+                cc = int(prev["cc"])
+            used_cc = {int(r["cc"]) for k, r in refs.items()
+                       if r.get("cc") is not None
+                       and int(r.get("channel", 1)) == channel
+                       and k != f"{kind}:{slot}"}
+            if cc is None:
+                cc = next((c for c in CC_LEARN_POOL if c not in used_cc), None)
+                if cc is None:
+                    raise RpcError(f"no safe CC left on channel {channel} — "
+                                   "map further knobs on another channel")
+            cc = int(cc)
+            if not 0 <= cc <= 127:
+                raise RpcError("CC out of range (0-127)")
+            if cc in used_cc:
+                raise RpcError(f"CC {cc} already drives another control of "
+                               "this plugin")
+
+            # synthetic device index: a live-bus address (< 256) no other
+            # control of this plugin sits on — allocated top-down to stay
+            # clear of real (low) DAW param indices where possible
+            if prev.get("device_index") is not None:
+                device_index = int(prev["device_index"])
+            else:
+                taken = {int(r["device_index"]) for r in refs.values()
+                         if r.get("device_index") is not None}
+                taken |= {int(r["param_index"]) for r in refs.values()
+                          if r.get("param_index") is not None}
+                device_index = next((i for i in range(0xFF, -1, -1)
+                                     if i not in taken), None)
+                if device_index is None:
+                    raise RpcError(
+                        "no free device param index left for this plugin")
+
+            h6 = codec.param_hash(f"midi cc {channel}.{cc}")
+            with self.roto.config_update():
+                self.roto._req(pcodec.add_plugin(hash8, dev.name[:12]),
+                               ok_codes=(RespCode.SUCCESS, RespCode.PLUGIN_EXISTS))
+                if kind == "switch":
+                    self.roto._req(pcodec.set_plugin_switch_config(
+                        pcodec.PluginSwitchConfig(
+                            plugin_hash=hash8, control_index=slot,
+                            mapped_param_index=device_index,
+                            mapped_param_hash=h6,
+                            min_value=0, max_value=0x7F, name=label,
+                            colour=21, led_on=21, led_off=0, steps=2)))
+                else:
+                    self.roto._req(pcodec.set_plugin_knob_config(
+                        pcodec.PluginKnobConfig(
+                            plugin_hash=hash8, control_index=slot,
+                            mapped_param_index=device_index,
+                            mapped_param_hash=h6,
+                            min_value=0, max_value=0x3FFF, name=label,
+                            colour=21, haptic=KnobHaptic.KNOB_300,
+                            indent1=UNUSED_INDENT, indent2=UNUSED_INDENT,
+                            steps=0)))
+
+            # the learn shot: if the plugin's CC learn is armed, THIS is the
+            # message it binds. Centre value so knob and plugin start aligned.
+            try:
+                self._cc_send(channel, cc, 0.5)
+            except ImportError:
+                raise RpcError("MIDI backend missing — install the [midi] "
+                               "extra (mido + python-rtmidi)")
+            except RuntimeError as exc:
+                raise RpcError(str(exc))
+
+            # NO param_index on purpose: cc refs must never feed the cross-DAW
+            # identity map — device_index is synthetic, not a DAW param
+            self._param_refs.setdefault(hash8.hex(), {})[f"{kind}:{slot}"] = {
+                "hash": hash8.hex(), "fx_name": dev.name,
+                "param_name": label, "cc": cc, "channel": channel,
+                "device_index": device_index}
+            self._save_param_refs()
+            self._device_map_ids.pop(hash8.hex(), None)
+            self.bridge.refresh_plugin_context()   # reload map + cc routes
+            self.bus.publish("device_map_changed",
+                             {"hash": hash8.hex(), "kind": kind, "slot": slot})
+            return {"written": True, "kind": kind, "slot": slot, "cc": cc,
+                    "channel": channel, "device_index": device_index,
+                    "hash": hash8.hex(), "name": label, "port": "Athens"}
 
         # -- device plugin-map store + the LINK registry ----------------------
         @rpc.method("list_device_plugins")

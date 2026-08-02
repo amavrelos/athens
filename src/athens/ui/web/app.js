@@ -128,7 +128,8 @@
   var state = {
     tracks: [], selected: 0, firstTrack: 0, transport: {}, connected: false,
     devices: [], selectedDevice: 0, params: [], learnMode: 0, deviceMode: "",
-    daw: "DAW", dawAlive: true, scriptStale: {},
+    daw: "DAW", dawAlive: true, dawDetected: true, scriptStale: {},
+    bridgePortMissing: false, bridgePortHint: "",
   };
   var knobs = [], paused = false, actPaused = false;
   // who drives who: "device" = the hardware picks the app view,
@@ -158,7 +159,7 @@
         "devices", "value", "touch", "param", "devparam", "frame", "setups",
         "progress", "learn", "sweep", "device_map_changed", "setup_learned",
         "mode", "setup_selected", "device_plugin_selected", "daw", "notice",
-        "script_stale", "trace"] });
+        "script_stale", "bridge_port", "reaper_osc", "trace"] });
       rpc("get_state").then(applyState);
       rpc("get_plugin_links").then(function (l) { pluginLinks = l; })
         .catch(function () {});
@@ -194,6 +195,11 @@
     $("#chip-connect").hidden = s.connected;
     if (!s.connected) $("#chip-connect").textContent = "connect ▸";
     state.dawAlive = s.daw_alive !== false;
+    state.dawDetected = s.daw_detected !== false;
+    state.bridgePortMissing = !!s.bridge_port_missing;
+    state.bridgePortHint = s.bridge_port_hint || "";
+    state.reaperOscMissing = !!s.reaper_osc_missing;
+    state.reaperOscHint = s.reaper_osc_hint || "";
     state.scriptStale = s.script_stale || {};
     renderReaperLink();
     refreshAll();
@@ -224,8 +230,15 @@
         t.title = "Athens installed v" + st.expected + " on disk, but "
           + state.daw + " is still running the previously loaded copy.";
       } else {
-        t.textContent = state.daw ? (up ? state.daw : state.daw + " closed") : "—";
-        t.title = up ? "" : (feedHint() || "");
+        // a never-detected DAW is only the fallback default — labelling it
+        // "REAPER closed" claims a detection that never happened
+        var closedLbl = state.dawDetected === false
+          ? "no DAW detected" : state.daw + " closed";
+        t.textContent = state.daw ? (up ? state.daw : closedLbl) : "—";
+        // alive-but-mute-OSC REAPER: green pill (it IS alive), but carry the
+        // "add the OSC surface" remedy where the user will hover
+        t.title = up ? (state.reaperOscMissing ? state.reaperOscHint : "")
+                     : (feedHint() || "");
       }
     }
   }
@@ -235,11 +248,28 @@
   function feedHint() {
     if (state.dawAlive !== false) return null;
     var d = (state.daw || "").toLowerCase();
+    if (state.dawDetected === false) {
+      // NOTHING announced itself — state.daw is only detect_daw's hardcoded
+      // fallback, so never say "detected". When the roto-bridge pair is
+      // missing, point at THAT: it's what keeps Cubase undetectable (the
+      // Windows no-virtual-MIDI trap), and the backend hint carries the
+      // platform-correct remedy (loopMIDI + autostart / IAC).
+      return "no DAW feed found — REAPER users: run “roto_fx_feed” from the "
+           + "Actions list. "
+           + (state.bridgePortMissing && state.bridgePortHint
+              ? state.bridgePortHint
+              : "Cubase users: open a project with the Roto-Control MIDI "
+                + "Remote script enabled.");
+    }
     if (d.indexOf("reaper") >= 0)
       return "REAPER detected — run “roto_fx_feed” from the Actions list to connect "
            + "(set it as a startup action to run automatically)";
     if (d.indexOf("cubase") >= 0)
-      return "Cubase detected — enable the Roto-Control MIDI Remote script to connect";
+      // a missing bridge pair outranks the script hint: without the port the
+      // script can neither bind nor answer, so "enable the script" is a dead end
+      return state.bridgePortMissing && state.bridgePortHint
+        ? state.bridgePortHint
+        : "Cubase detected — enable the Roto-Control MIDI Remote script to connect";
     if (d.indexOf("pro tools") >= 0)
       return "Pro Tools — enable an IAC bus (Audio MIDI Setup), then point its HUI "
            + "(Setup ▸ Peripherals ▸ MIDI Controllers) at the bus Athens bound to";
@@ -300,6 +330,7 @@
       case "daw":
         if (d.name) state.daw = d.name;      // hot-swap: the live DAW changed
         state.dawAlive = d.alive;
+        if (d.detected !== undefined) state.dawDetected = d.detected;
         renderTracks(); renderReaperLink();
         renderChain(); renderDevicePanel();  // refresh the "how to connect" hint
         setFoot(d.alive ? state.daw + " connected"
@@ -345,6 +376,20 @@
       case "script_stale":
         state.scriptStale = d.all || {};
         renderReaperLink();
+        break;
+      case "reaper_osc":
+        // REAPER's feed beats but OSC never spoke (Preferences device
+        // missing / UDP 8000 squatted) — or the first packet just arrived
+        state.reaperOscMissing = !!d.missing;
+        state.reaperOscHint = d.hint || "";
+        renderTracks(); renderReaperLink();
+        break;
+      case "bridge_port":
+        // roto-bridge pair appeared/vanished — refresh every connect hint
+        state.bridgePortMissing = !!d.missing;
+        state.bridgePortHint = d.hint || "";
+        renderTracks(); renderReaperLink();
+        renderChain(); renderDevicePanel();
         break;
       case "device_map_changed": {
         // the device just stored a learn — refresh whatever shows that map
@@ -408,6 +453,11 @@
       cnt.title = "REAPER's OSC can't report the project size, so these may " +
         "be padded/phantom tracks. Load reaper/roto_fx_feed.lua in REAPER " +
         "(Actions → Load ReaScript, then run it) to show the real count.";
+    } else if (state.reaperOscMissing) {
+      // the inverse hole: the feed beats (REAPER alive) but OSC never spoke —
+      // no tracks, dead knob writes, and without this badge no signal at all
+      cnt.textContent = "⚠ OSC off";
+      cnt.title = state.reaperOscHint;
     } else {
       cnt.textContent = state.tracks.length ? state.daw + " · " +
         state.tracks.length : "—";
@@ -441,7 +491,9 @@
     $("#bank-desc").textContent = state.tracks.length
       ? "Mixer · tracks " + (first + 1) + "–" + last +
         " · knobs = VOLUME · buttons = MUTE / SOLO"
-      : "waiting for " + state.daw + "…";
+      // never "waiting for REAPER" when REAPER is only the fallback default
+      : (state.dawDetected === false ? "waiting for a DAW feed…"
+                                     : "waiting for " + state.daw + "…");
   }
 
 
@@ -513,7 +565,9 @@
   /* ================= PLUGIN VIEW ================= */
   var paramRows = {};          // param index -> {row, bar, out}
   var paramFilter = "";
-  var mappingBadges = {};      // param index -> "K3"/"B2" from the linked map
+  var mappingBadges = {};      // param index -> "K3"/"B2" from the plugin's map
+  var mapParam = null;         // param index the user picked to map in Athens
+  var occupiedKnob = {};       // knob slot -> true, from the focused plugin's map
 
   function loadPluginView() {
     rpc("get_devices").then(function (d) {
@@ -531,24 +585,29 @@
   }
 
   function loadMappingBadges() {
-    mappingBadges = {};
+    mappingBadges = {}; occupiedKnob = {};
     var d = state.devices.find(function (x) { return x.index === state.selectedDevice; });
-    var link = d && pluginLinks[d.name];
-    if (!link) { return; }
+    var hash = d && d.hash;            // the hash the bridge announces (linked or raw)
+    if (!hash) { renderMapForm(); return; }
     function apply(detail) {
       Object.keys(detail.knobs).forEach(function (s) {
-        mappingBadges[detail.knobs[s].param_index] = "K" + (+s + 1);
+        var k = detail.knobs[s];
+        occupiedKnob[+s] = true;
+        // a CC-mapped knob's param_index is synthetic — badging it would tag
+        // whatever unrelated DAW param happens to share the number
+        if (k.ref && k.ref.cc != null) return;
+        mappingBadges[k.param_index] = "K" + (+s + 1);
       });
       Object.keys(detail.switches).forEach(function (s) {
         mappingBadges[detail.switches[s].param_index] = "B" + (+s + 1);
       });
-      renderParams();
+      renderParams(); renderMapForm();
     }
-    if (mapCache[link.hash]) { apply(mapCache[link.hash]); return; }
-    rpc("get_device_plugin", { hash: link.hash }).then(function (dd) {
-      mapCache[link.hash] = dd;
+    if (mapCache[hash]) { apply(mapCache[hash]); return; }
+    rpc("get_device_plugin", { hash: hash }).then(function (dd) {
+      mapCache[hash] = dd;
       apply(dd);
-    }).catch(function () {});   // serial not connected: badges just absent
+    }).catch(function () { renderMapForm(); });   // no stored map yet / serial off
   }
 
   function renderChain() {
@@ -592,7 +651,7 @@
     state.params.forEach(function (p) {
       if (filter && p.name.toLowerCase().indexOf(filter) < 0 &&
           String(p.index) !== filter) return;
-      var row = el("div", "trow params-grid");
+      var row = el("div", "trow params-grid" + (p.index === mapParam ? " selected" : ""));
       var bar = el("div", "valbar");
       bar.title = "drag to set";
       var fill = el("i"); fill.style.width = (p.value * 100).toFixed(1) + "%";
@@ -600,8 +659,13 @@
       var out = el("span", "mono", p.display || "");
       var stepTag = el("span", "pnum", p.steps ? p.steps + "st" : "");
       var badge = mappingBadges[p.index];
+      var pnameEl = el("span", "pname", p.name);
+      pnameEl.title = "tap to map this parameter to a knob";
+      pnameEl.onclick = (function (idx) {
+        return function () { selectMapParam(idx); };
+      })(p.index);
       row.append(el("span", "pnum", p.index),
-                 el("span", "pname", p.name),
+                 pnameEl,
                  bar,
                  stepTag,
                  out,
@@ -681,9 +745,11 @@
       $("#learn-pill").textContent = "LEARN OFF";
       $("#sweepbar").hidden = true;
       loadParams();
+      renderMapForm();
       return;
     }
     state.learnMode = d.mode;
+    renderMapForm();             // emphasise the Athens map form while armed
     var pill = $("#learn-pill");
     pill.dataset.state = d.mode === 1 ? "armed" : "off";
     pill.textContent = d.mode === 1 ? "LEARN ARMED" : "LEARN OFF";
@@ -719,6 +785,118 @@
     paramFilter = this.value.trim();
     renderParams();
   };
+
+  /* -- direct map: pick a param + a knob in Athens, write it over serial ----- */
+  function selectMapParam(idx) {
+    mapParam = idx;
+    renderParams();          // reflect the .selected row
+    renderMapForm();
+  }
+
+  function nextFreeKnob() {
+    for (var s = 0; s < 32; s++) if (!occupiedKnob[s]) return s;
+    return 0;
+  }
+
+  function knobFor(paramIdx) {         // reuse the existing slot, else next free
+    var b = mappingBadges[paramIdx];
+    if (b && b[0] === "K") return parseInt(b.slice(1), 10) - 1;
+    return nextFreeKnob();
+  }
+
+  function renderMapForm() {
+    var form = $("#map-form"); if (!form) return;
+    renderCcForm();
+    var slotIn = $("#map-slot"), btn = $("#map-btn");
+    var target = $("#map-target"), note = $("#map-note");
+    var armed = state.learnMode === 1;
+    form.classList.toggle("armed", armed);
+    var p = mapParam == null ? null
+      : state.params.find(function (x) { return x.index === mapParam; });
+    if (!p) {
+      target.textContent = armed
+        ? "device is in LEARN — tap a parameter to map it here"
+        : "tap a parameter on the left to map it to a knob";
+      slotIn.disabled = true; btn.disabled = true; note.textContent = "";
+      return;
+    }
+    target.replaceChildren(el("span", "mapname", p.name),
+                           el("span", "hint", " · param " + p.index));
+    slotIn.value = knobFor(p.index) + 1;
+    slotIn.disabled = false;
+    btn.disabled = !state.serial;
+    var existing = mappingBadges[p.index];
+    note.textContent = !state.serial
+      ? "connect the ROTO's config (serial) port to map"
+      : (existing ? "already on " + existing + " — Map re-binds it"
+                  : "writes straight to the device — no sweep needed");
+  }
+
+  function doMap() {
+    if (mapParam == null) return;
+    var pidx = mapParam;
+    var slot = Math.max(1, Math.min(64, parseInt($("#map-slot").value, 10) || 1)) - 1;
+    $("#map-btn").disabled = true;
+    rpc("map_device_control", { param: pidx, slot: slot, kind: "knob" })
+      .then(function (r) {
+        setFoot("mapped param " + pidx + " → knob " + (slot + 1));
+        learnFeedMsg("✓ mapped " + (r.name || ("param " + pidx)) +
+                     " → knob " + (slot + 1) +
+                     (r.steps ? " (" + r.steps + " steps)" : ""));
+        // badges + occupied slots refresh via the device_map_changed event
+      })
+      .catch(function (e) {
+        var msg = (e && e.message) ? e.message : String(e);
+        setFoot("map failed: " + msg);
+        learnFeedMsg("✕ map failed: " + msg);
+        renderMapForm();
+      });
+  }
+
+  $("#map-btn").onclick = doMap;
+  $("#map-slot").onkeydown = function (ev) { if (ev.key === "Enter") doMap(); };
+
+  /* -- plugin CC learn: the plugin binds a CC Athens sends, knob relays it -- */
+  function renderCcForm() {
+    var btn = $("#map-cc-btn"); if (!btn) return;
+    var slotIn = $("#map-cc-slot");
+    if (document.activeElement !== slotIn) slotIn.value = nextFreeKnob() + 1;
+    btn.disabled = !state.serial;
+    $("#map-cc-note").textContent = !state.serial
+      ? "connect the ROTO's config (serial) port to map"
+      : "sends one CC on the 'Athens' MIDI port — set it as the track's " +
+        "input (armed, monitoring) so the plugin hears it";
+  }
+
+  function doMapCC() {
+    var name = $("#map-cc-name").value.trim();
+    if (!name) {
+      setFoot("give the CC knob a label first");
+      $("#map-cc-name").focus();
+      return;
+    }
+    var slot = Math.max(1, Math.min(64, parseInt($("#map-cc-slot").value, 10) || 1)) - 1;
+    $("#map-cc-btn").disabled = true;
+    rpc("map_device_control_cc", { slot: slot, name: name, kind: "knob" })
+      .then(function (r) {
+        setFoot("CC " + r.cc + " sent → knob " + (slot + 1));
+        learnFeedMsg("✓ sent CC " + r.cc + " ch " + r.channel + " on '" +
+                     (r.port || "Athens") + "' — a waiting plugin binds it; " +
+                     "knob " + (slot + 1) + " = " + r.name);
+        $("#map-cc-name").value = "";
+        $("#map-cc-btn").disabled = !state.serial;
+      })
+      .catch(function (e) {
+        var msg = (e && e.message) ? e.message : String(e);
+        setFoot("CC map failed: " + msg);
+        learnFeedMsg("✕ CC map failed: " + msg);
+        $("#map-cc-btn").disabled = !state.serial;
+      });
+  }
+
+  $("#map-cc-btn").onclick = doMapCC;
+  $("#map-cc-name").onkeydown = function (ev) { if (ev.key === "Enter") doMapCC(); };
+  $("#map-cc-slot").onkeydown = function (ev) { if (ev.key === "Enter") doMapCC(); };
 
   /* ================= DEVICE (stored plugin maps: inspect, EDIT, link) ===== */
   var devMaps = [], devMapSel = null, devMapDetail = null,

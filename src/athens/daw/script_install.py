@@ -160,11 +160,29 @@ def sync_cubase(force: bool = False) -> List[str]:
     return notes
 
 
+def reaper_resource_root() -> Path:
+    """REAPER's EFFECTIVE resource dir: the user's Located folder when set,
+    else the platform default. THE one resolver — the script drop
+    (reaper_scripts_dir) AND the feed IPC dir (fx_feed.default_feed_dir) hang
+    off it, because the Lua derives everything from reaper.GetResourcePath():
+    a portable install (resource dir next to reaper.exe, the common Windows
+    case auto-discovery can't see) writes its heartbeat under the PORTABLE
+    root, and any Athens path not following the override reads the dead
+    default location forever. Forgiving like the Cubase resolver's descent: a
+    user who picked Scripts/ itself meant its parent."""
+    override = _overrides().get("reaper")
+    if not override:
+        return reaper_resource_dir()
+    root = Path(override)
+    if root.name.lower() == "scripts":
+        root = root.parent
+    return root
+
+
 def reaper_scripts_dir() -> Optional[Path]:
     """REAPER's Scripts/ folder, honouring a user 'Locate' override — or None
     when REAPER isn't installed here / the override is bad."""
-    override = _overrides().get("reaper")
-    resource = Path(override) if override else reaper_resource_dir()
+    resource = reaper_resource_root()
     return (resource / "Scripts") if resource.is_dir() else None
 
 
@@ -208,7 +226,7 @@ def status() -> Dict[str, dict]:
     UI's Locate panel: {daw: {path, found, located}}."""
     ov = _overrides()
     cubase = _steinberg_driver_roots()
-    reaper_res = Path(ov["reaper"]) if ov.get("reaper") else reaper_resource_dir()
+    reaper_res = reaper_resource_root()
     return {
         "cubase": {
             "path": str(cubase[0]) if cubase else ov.get("cubase", ""),

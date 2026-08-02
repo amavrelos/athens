@@ -26,7 +26,7 @@ var midiremote_api = require('midiremote_api_v1')
 // HELLO handshake; Athens compares it to the copy it bundles and, on a
 // mismatch, prompts you to restart Cubase (the host caches the script it
 // loaded, so an on-disk update isn't live until reload). Edit below? Bump this.
-var SCRIPT_VERSION = '8'
+var SCRIPT_VERSION = '9'
 // identity + version in one handshake token: "cubase <version>". A pre-version
 // script sent just "cubase"; Athens reads a missing version as an older build.
 var HELLO_ID = 'cubase ' + SCRIPT_VERSION
@@ -115,6 +115,13 @@ driver.makeDetectionUnit().detectPortPair(midiInput, midiOutput)
 driver.makeDetectionUnit().detectPortPair(midiInput, midiOutput)
     .expectInputNameEquals('roto-bridge')
     .expectOutputNameEquals('roto-bridge')
+// Windows decorates port names (a loopMIDI 'roto-bridge' can surface with a
+// prefix/suffix depending on the MIDI stack): a substring unit still binds
+// those. Units are alternatives — the first one whose expectations all match
+// wins, so this is a safe superset of the Equals units above.
+driver.makeDetectionUnit().detectPortPair(midiInput, midiOutput)
+    .expectInputNameContains('roto-bridge')
+    .expectOutputNameContains('roto-bridge')
 
 function send(ctx, bytes) { midiOutput.sendMidi(ctx, bytes) }
 

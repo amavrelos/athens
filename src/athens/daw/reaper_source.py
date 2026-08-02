@@ -117,6 +117,10 @@ class ReaperSysexSource(SysexDawSource):
         # -- liveness: combined feed-heartbeat OR recent OSC --
         self._last_osc = 0.0                        # monotonic of last inbound OSC
         self._feed_alive = False                    # feed heartbeat edge state
+        self._feed_alive_at = 0.0                   # when the alive edge rose —
+        #                                             grace for osc_silent()
+        self.osc_bind_error = ""                    # recv socket bind failure
+        #                                             (port squatted) — see start()
         self._alive_pub = True                      # published alive (optimistic
         #                                             at start, matches service)
         self._live_start = 0.0                      # start() time, for the grace
@@ -189,11 +193,22 @@ class ReaperSysexSource(SysexDawSource):
         d.map("/track/*/fx/*/fxparam/*/name", live(self._on_fxparam_name))
         d.map("/track/*/fx/*/fxparam/*/value", live(self._on_fxparam_value))
         d.set_default_handler(live(lambda a, *v: None))
-        self._server = ThreadingOSCUDPServer(self._osc_recv, d)
-        threading.Thread(target=self._server.serve_forever, daemon=True,
-                         name="reaper-osc").start()
-        log.info("ReaperSysexSource: send -> %s, feedback <- %s",
-                 self._osc_send, self._osc_recv)
+        try:
+            self._server = ThreadingOSCUDPServer(self._osc_recv, d)
+        except OSError as exc:
+            # UDP 8000 squatted by another app (common on Windows): crashing
+            # the whole launch here reads as "Athens is broken" with no clue.
+            # Stay up — sends still work, the feed still runs — record the
+            # failure so osc_silent()/the service can name the real culprit.
+            self.osc_bind_error = str(exc)
+            log.warning("cannot bind REAPER OSC feedback socket %s: %s — "
+                        "no feedback (motors/mixer) until the port is free",
+                        self._osc_recv, exc)
+        else:
+            threading.Thread(target=self._server.serve_forever, daemon=True,
+                             name="reaper-osc").start()
+            log.info("ReaperSysexSource: send -> %s, feedback <- %s",
+                     self._osc_send, self._osc_recv)
         self.refresh_state()
 
     def refresh_state(self) -> None:
@@ -357,8 +372,45 @@ class ReaperSysexSource(SysexDawSource):
         """Feed heartbeat edge. Feed alive => REAPER alive; feed gone only
         blanks if OSC has ALSO fallen silent (REAPER itself is gone), so a
         stopped feed script under a still-open REAPER keeps the mixer live."""
+        if alive and not self._feed_alive:
+            self._feed_alive_at = time.monotonic()   # osc_silent grace anchor
         self._feed_alive = alive
         self._apply_alive(alive or self._osc_fresh())
+
+    def osc_silent(self) -> bool:
+        """The ReaScript heartbeat proves REAPER is ALIVE, yet its OSC surface
+        has NEVER said a word: near-certainly the one-time Preferences >
+        Control/OSC/web device is missing (or our recv socket failed to bind) —
+        the app shows a live REAPER while the mixer stays empty and every knob
+        write is dropped, with no error anywhere. Only the never-heard case is
+        reported: a configured-but-idle REAPER can legitimately go quiet, so
+        'went silent later' must not nag (that is check_alive's territory).
+        Grace after the feed-alive edge: our refresh_state on the first track
+        count makes a configured REAPER speak within a beat, so give it
+        _OSC_GONE_S before concluding the surface isn't there. False when
+        python-osc itself is missing — a different, already-logged problem."""
+        if not self._feed_alive or self._last_osc > 0.0:
+            return False
+        if self._server is None and not self.osc_bind_error:
+            return False                    # OSC never started (no python-osc)
+        return time.monotonic() - self._feed_alive_at > _OSC_GONE_S
+
+    def retarget_feed(self, directory=None) -> None:
+        """The user Located REAPER's (portable) resource folder: follow the
+        feed to the new IPC dir NOW. make_source resolves the override only at
+        construction, so without this the RUNNING source would keep watching
+        the old, forever-dead dir until an app relaunch. Resets the feed-alive
+        edge and the start-up grace so liveness and the phantom-bank guard
+        treat the new dir as a fresh start (a heartbeat there re-lights
+        everything within a beat)."""
+        if self._feed is None:
+            return
+        self._feed_alive = False
+        self._feed_active = False
+        with self._lock:
+            self._track_count = None        # unknown again until the new feed
+        self._feed_start = time.monotonic()
+        self._feed.retarget(directory)
 
     def selected_track(self) -> int:
         return self._selected

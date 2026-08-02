@@ -11,8 +11,20 @@
 #
 #   sh scripts/install-cubase.sh
 #
-# Then create a virtual MIDI port pair named "roto-bridge" (macOS: Audio MIDI
-# Setup -> IAC Driver -> add a "roto-bridge" port) and run:
+# POSIX shell — does NOT run on Windows. There, Athens auto-installs the script
+# at launch; the manual fallback is copying cubase/Melbourne Instruments_Roto-Control.js to
+#   %USERPROFILE%\Documents\Steinberg\<Host>\MIDI Remote\Driver Scripts\Local\Melbourne Instruments\Roto-Control\Melbourne Instruments_Roto-Control.js
+#
+# Then create a virtual MIDI port pair named "roto-bridge":
+#   macOS   — Audio MIDI Setup -> IAC Driver -> add a "roto-bridge" port.
+#   Windows — no built-in virtual MIDI; install loopMIDI
+#             (winget install --id TobiasErichsen.loopMIDI --exact --silent
+#              --accept-package-agreements --accept-source-agreements),
+#             add a port named exactly "roto-bridge", and enable "Autostart
+#             loopMIDI": its ports are per-user and exist only while loopMIDI
+#             runs, so without autostart the port vanishes on reboot and
+#             Cubase silently stops being detected. See cubase/README.md.
+# and run:
 #   roto-reaper ui --daw cubase
 set -e
 cd "$(dirname "$0")/.."
